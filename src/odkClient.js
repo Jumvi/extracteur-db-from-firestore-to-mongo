@@ -11,7 +11,7 @@ function buildMediaUrl(template, params) {
     .replace('{filename}', encodeURIComponent(params.filename));
 }
 
-function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate }) {
+function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate, submissionsTemplate }) {
   const ax = axios.create({ baseURL: baseUrl, timeout: 60000 });
   let cookie = null;
 
@@ -39,8 +39,24 @@ function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate }) {
     }
   }
 
+  function buildSubmissionsUrl(template, projectId, formId, query) {
+    if (!template) return `/projects/${projectId}/forms/${formId}.svc/Submissions${query || ''}`;
+    let url = template.replace('{projectId}', projectId).replace('{formId}', formId);
+    // if template expects a {query} placeholder, inject without leading '?'
+    if (url.indexOf('{query}') !== -1) {
+      const q = query && query.startsWith('?') ? query.substring(1) : (query || '');
+      return url.replace('{query}', q);
+    }
+    // otherwise append query appropriately
+    if (query) {
+      if (url.includes('?')) return `${url}&${query.substring(1)}`;
+      return `${url}${query}`;
+    }
+    return url;
+  }
+
   async function fetchSubmissions(projectId, formId, query) {
-    const path = `/projects/${projectId}/forms/${formId}.svc/Submissions${query || ''}`;
+    const path = buildSubmissionsUrl(submissionsTemplate, projectId, formId, query);
     const res = await ax.get(path);
     return res.data;
   }

@@ -60,28 +60,71 @@ function detectMediaFields(obj) {
 }
 
 async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission) {
-  const instanceId = submission.instanceId || submission.instanceId || submission._id || submission.uuid;
-  const doc = { ...submission };
-  // detect media
-  const medias = detectMediaFields(submission);
-  for (const m of medias) {
-    try {
-      const filename = m.filename;
-      const mediaStream = await odk.downloadMedia(projectId, formId, instanceId, filename);
-      if (s3client && s3bucket) {
-        const key = `${formId}/${instanceId}/${filename}`;
-        const url = await uploadToS3(s3client, s3bucket, key, mediaStream, 'application/octet-stream');
-        doc[`${m.path}_url`] = url;
-      } else {
-        const res = await uploadToGridFS(bucket, `${formId}_${instanceId}_${filename}`, mediaStream);
-        doc[`${m.path}_gridfs`] = res;
-      }
-    } catch (err) {
-      logger.error({ err }, 'media download/upload failed');
-    }
+  // robust instanceId detection across common property names
+  function findInstanceId(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    const keys = ['instanceId', 'instanceID', 'InstanceId', '_id', 'id', 'uuid', 'submissionId', 'SubmissionId', 'SubmissionUUID', '__id'];
+    for (const k of keys) if (obj[k]) return String(obj[k]);
+    // nested meta.instanceID
+    if (obj.meta && (obj.meta.instanceID || obj.meta.instanceId)) return String(obj.meta.instanceID || obj.meta.instanceId);
+    // try common OData system container
+    if (obj.__system && (obj.__system.instanceId || obj.__system.instanceID)) return String(obj.__system.instanceId || obj.__system.instanceID);
+    return null;
   }
 
-  await upsertSubmission(formId, instanceId, doc);
+  const instanceId = findInstanceId(submission) || null;
+  const doc = { ...submission };
+
+  // build proxy template
+  const proxyTemplate = process.env.ODK_ATTACHMENT_PROXY_TEMPLATE || process.env.ODK_ATTACHMENT_PROXY || '/api/getAttachment?instanceId={instanceId}&filename={filename}';
+
+  // detect media and build attachments metadata
+  const medias = detectMediaFields(submission);
+  const attachments = [];
+  for (const m of medias) {
+    const filename = m.filename;
+    const fieldPath = m.path;
+    const att = { filename, fieldPath };
+
+    // build proxy URL (for frontend) if instanceId is available
+    if (instanceId) {
+      att.proxyUrl = proxyTemplate.replace('{instanceId}', encodeURIComponent(instanceId))
+        .replace('{filename}', encodeURIComponent(filename))
+        .replace('{formId}', encodeURIComponent(formId))
+        .replace('{projectId}', encodeURIComponent(projectId));
+    }
+
+    // attempt to download + store media (S3 or GridFS)
+    try {
+      if (instanceId) {
+        const mediaStream = await odk.downloadMedia(projectId, formId, instanceId, filename);
+        if (s3client && s3bucket) {
+          const key = `${formId}/${instanceId}/${filename}`;
+          const url = await uploadToS3(s3client, s3bucket, key, mediaStream, 'application/octet-stream');
+          att.s3 = url;
+          // keep backward compatibility
+          doc[`${fieldPath}_url`] = url;
+        } else {
+          const res = await uploadToGridFS(bucket, `${formId}_${instanceId}_${filename}`, mediaStream);
+          att.gridFs = res;
+          doc[`${fieldPath}_gridfs`] = res;
+        }
+      } else {
+        logger.warn({ fieldPath, filename }, 'no instanceId, skipping direct media download');
+      }
+    } catch (err) {
+      logger.error({ err, filename, instanceId }, 'media download/upload failed');
+    }
+
+    attachments.push(att);
+  }
+
+  if (attachments.length) doc.attachments = attachments;
+
+  // ensure we persist a stable instanceId in the document and use it as the upsert key
+  const effectiveId = instanceId || (doc && (doc.__id || doc._id || doc.id || doc.uuid || (doc.meta && (doc.meta.instanceID || doc.meta.instanceId))));
+  if (effectiveId) doc.instanceId = effectiveId;
+  await upsertSubmission(formId, effectiveId || null, doc);
 }
 
 async function runOnce() {
@@ -92,7 +135,7 @@ async function runOnce() {
   const expand = opts.expand || '*';
   const backwindow = (opts.backwindow || 10) * 1000;
 
-  const odk = createOdkClient({ baseUrl: process.env.ODK_BASE_URL, loginUrl: process.env.ODK_LOGIN_URL, email: process.env.ODK_EMAIL, pass: process.env.ODK_PASS, mediaTemplate: process.env.MEDIA_URL_TEMPLATE });
+  const odk = createOdkClient({ baseUrl: process.env.ODK_BASE_URL, loginUrl: process.env.ODK_LOGIN_URL, email: process.env.ODK_EMAIL, pass: process.env.ODK_PASS, mediaTemplate: process.env.MEDIA_URL_TEMPLATE, submissionsTemplate: process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL });
   await odk.login();
 
   // mongo connection and bucket
@@ -122,18 +165,23 @@ async function runOnce() {
   let more = true;
   const limit = pLimit(4);
 
-  while (more) {
-    const qs = [`?$expand=${encodeURIComponent(expand)}`];
+  // helper to build a lightweight listing query (only ids + system metadata)
+  function buildListQstr() {
+    const qs = [];
+    qs.push(`$select=${encodeURIComponent('__id,__system')}`);
     qs.push(`$top=${pageSize}`);
     qs.push(`$skip=${skip}`);
-    if (since) qs.push(`$filter=submittedAt gt ${encodeURIComponent(new Date(since).toISOString())}`);
-    const qstr = qs.length ? `?${qs.join('&')}` : '';
-    logger.info({ qstr }, 'fetching submissions');
+    return qs.length ? `?${qs.join('&')}` : '';
+  }
+
+  while (more) {
+    const qstr = buildListQstr();
+    logger.info({ qstr }, 'fetching submission ids (lightweight)');
     let data;
     try {
       data = await odk.fetchSubmissions(projectId, formId, qstr);
     } catch (err) {
-      logger.error({ err }, 'failed fetching submissions');
+      logger.error({ err }, 'failed fetching submission ids');
       throw err;
     }
 
@@ -142,9 +190,44 @@ async function runOnce() {
 
     await Promise.all(items.map(item => limit(async () => {
       try {
-        const submittedAt = new Date(item.submittedAt || item.createdAt || item._submittedAt || Date.now());
+        // extract candidate id and submission date from lightweight row
+        const rawId = item.__id || item._id || item.id || item.instanceId || item.uuid;
+        let listedDate = null;
+        if (item.__system) {
+          listedDate = item.__system.submissionDate || item.__system.createdAt || item.__system.submissiontime || item.__system.timestamp;
+        }
+        // normalize listedDate
+        const listedAt = listedDate ? new Date(listedDate) : null;
+
+        // if we have a since and listedAt, skip early
+        if (since && listedAt && listedAt <= since) return;
+
+        // fetch full detail per-instance (with $expand) to get attachments and nested repeats
+        let record = item;
+        if (rawId) {
+          // ensure proper quoting/encoding for OData key - preserve uuid: prefix if present
+          const encodedId = encodeURIComponent(String(rawId));
+          const perQ = `('${encodedId}')?${`$expand=${encodeURIComponent(expand)}`}`;
+          try {
+            const detail = await odk.fetchSubmissions(projectId, formId, perQ);
+            if (detail && Array.isArray(detail)) record = detail[0] || record;
+            else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
+            else if (detail && typeof detail === 'object') record = detail;
+          } catch (err) {
+            logger.warn({ err, rawId }, 'failed fetching per-instance detail, falling back to list item');
+          }
+        }
+
+        // determine submittedAt from the detailed record if possible
+        let submittedAt = null;
+        if (record.__system) submittedAt = record.__system.submissionDate || record.__system.createdAt;
+        if (!submittedAt) submittedAt = record.submittedAt || record.createdAt || record._submittedAt;
+        submittedAt = submittedAt ? new Date(submittedAt) : new Date();
+
+        if (since && submittedAt <= since) return;
         if (submittedAt > maxSeen) maxSeen = submittedAt;
-        await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, item);
+
+        await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record);
       } catch (err) {
         logger.error({ err }, 'processing submission failed');
       }
