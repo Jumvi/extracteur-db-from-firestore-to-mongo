@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "migrate": "node src/index.js",
+    "odk:migrate": "node src/odk-migrate.js --once",
+    "odk:migrate:daemon": "node src/odk-migrate.js --daemon",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
