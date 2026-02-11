@@ -26,7 +26,10 @@ function getBucket() {
 async function upsertSubmission(formId, instanceId, doc) {
   await connect();
   const col = db.collection(`odk_submissions_${formId}`);
-  await col.updateOne({ instanceId }, { $set: doc }, { upsert: true });
+  // Use replaceOne to avoid Mongo "path conflict" errors when doc contains
+  // nested objects whose structure may differ from existing documents.
+  // We expect `doc` to contain a stable `instanceId` field already.
+  await col.replaceOne({ instanceId }, doc, { upsert: true });
 }
 
 async function getSyncState(formId) {

@@ -68,7 +68,7 @@ function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate, submis
     return res.data;
   }
 
-  return { login, fetchSubmissions, downloadMedia, axios: ax };
+  return { login, fetchSubmissions, downloadMedia, axios: ax, buildSubmissionsUrl };
 }
 
 module.exports = { createOdkClient };

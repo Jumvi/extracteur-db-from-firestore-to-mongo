@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 require('dotenv').config();
 const { program } = require('commander');
+const util = require('util');
 let pLimit = require('p-limit');
 if (pLimit && typeof pLimit !== 'function' && pLimit.default) pLimit = pLimit.default;
 const { createOdkClient } = require('./odkClient');
@@ -21,7 +22,9 @@ program
   .option('--daemon', 'run continuously')
   .option('--pageSize <n>', 'page size', parseInt, 200)
   .option('--backwindow <secs>', 'backwindow seconds', parseInt, 10)
-  .option('--expand <exp>', 'OData $expand value', '*')
+  .option('--expand <exp>', 'OData $expand value', '')
+  .option('--skip-media', 'do not download or store media')
+  .option('--dry-run', 'print resulting documents instead of upserting')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -59,7 +62,7 @@ function detectMediaFields(obj) {
   return media;
 }
 
-async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission) {
+async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission, { skipMedia = false, dryRun = false } = {}) {
   // robust instanceId detection across common property names
   function findInstanceId(obj) {
     if (!obj || typeof obj !== 'object') return null;
@@ -94,15 +97,14 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
         .replace('{projectId}', encodeURIComponent(projectId));
     }
 
-    // attempt to download + store media (S3 or GridFS)
+    // attempt to download + store media (S3 or GridFS) unless skipMedia is set
     try {
-      if (instanceId) {
+      if (!skipMedia && instanceId) {
         const mediaStream = await odk.downloadMedia(projectId, formId, instanceId, filename);
         if (s3client && s3bucket) {
           const key = `${formId}/${instanceId}/${filename}`;
           const url = await uploadToS3(s3client, s3bucket, key, mediaStream, 'application/octet-stream');
           att.s3 = url;
-          // keep backward compatibility
           doc[`${fieldPath}_url`] = url;
         } else {
           const res = await uploadToGridFS(bucket, `${formId}_${instanceId}_${filename}`, mediaStream);
@@ -110,7 +112,17 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
           doc[`${fieldPath}_gridfs`] = res;
         }
       } else {
-        logger.warn({ fieldPath, filename }, 'no instanceId, skipping direct media download');
+        // build proxy URL only (no binary transfer)
+        if (instanceId) {
+          att.proxyUrl = proxyTemplate.replace('{instanceId}', encodeURIComponent(instanceId))
+            .replace('{filename}', encodeURIComponent(filename))
+            .replace('{formId}', encodeURIComponent(formId))
+            .replace('{projectId}', encodeURIComponent(projectId));
+          // provide a lightweight url field so frontend can fetch the binary later
+          doc[`${fieldPath}_url`] = att.proxyUrl;
+        } else {
+          logger.debug({ fieldPath, filename }, 'no instanceId, skipping media proxy');
+        }
       }
     } catch (err) {
       logger.error({ err, filename, instanceId }, 'media download/upload failed');
@@ -124,7 +136,12 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
   // ensure we persist a stable instanceId in the document and use it as the upsert key
   const effectiveId = instanceId || (doc && (doc.__id || doc._id || doc.id || doc.uuid || (doc.meta && (doc.meta.instanceID || doc.meta.instanceId))));
   if (effectiveId) doc.instanceId = effectiveId;
-  await upsertSubmission(formId, effectiveId || null, doc);
+  if (dryRun) {
+    logger.info({ instanceId: effectiveId }, 'dry-run document:');
+    console.log(util.inspect(doc, { depth: 5 }));
+  } else {
+    await upsertSubmission(formId, effectiveId || null, doc);
+  }
 }
 
 async function runOnce() {
@@ -132,7 +149,8 @@ async function runOnce() {
   if (!formId) throw new Error('--form is required');
   const projectId = opts.project;
   const pageSize = opts.pageSize || 200;
-  const expand = opts.expand || '*';
+  // disable per-instance $expand by default (empty string). Set via --expand if needed.
+  const expand = opts.expand || '';
   const backwindow = (opts.backwindow || 10) * 1000;
 
   const odk = createOdkClient({ baseUrl: process.env.ODK_BASE_URL, loginUrl: process.env.ODK_LOGIN_URL, email: process.env.ODK_EMAIL, pass: process.env.ODK_PASS, mediaTemplate: process.env.MEDIA_URL_TEMPLATE, submissionsTemplate: process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL });
@@ -204,7 +222,8 @@ async function runOnce() {
 
         // fetch full detail per-instance (with $expand) to get attachments and nested repeats
         let record = item;
-        if (rawId) {
+        // per-instance hydration with $expand is disabled by default; only run if expand provided
+        if (rawId && expand) {
           // ensure proper quoting/encoding for OData key - preserve uuid: prefix if present
           const encodedId = encodeURIComponent(String(rawId));
           const perQ = `('${encodedId}')?${`$expand=${encodeURIComponent(expand)}`}`;
@@ -218,6 +237,75 @@ async function runOnce() {
           }
         }
 
+        // If per-instance $expand is disabled, attempt to fetch the full record using a collection filter
+        if (rawId && !expand) {
+          try {
+            const q = `?$filter=__id eq '${String(rawId)}'`;
+            const detail = await odk.fetchSubmissions(projectId, formId, q);
+            if (detail && Array.isArray(detail)) record = detail[0] || record;
+            else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
+            else if (detail && typeof detail === 'object') record = detail;
+          } catch (err) {
+            logger.debug({ err, rawId }, 'per-instance fetch with filter failed, will fallback');
+          }
+        }
+
+        // If per-instance $expand is disabled, try to hydrate nested repeats/children
+        async function fetchNavigationChildren(rec, rawId) {
+          if (!rec || typeof rec !== 'object') return {};
+          const children = {};
+          const limitNav = pLimit(4);
+          const tasks = [];
+          for (const k of Object.keys(rec)) {
+            // look for keys like 'childCollection@odata.navigationLink'
+            const m = k.match(/^(.+)@odata\.navigationLink$/);
+            if (!m) continue;
+            const childName = m[1];
+            const link = rec[k];
+            if (!link) continue;
+            tasks.push(limitNav(async () => {
+              // try the navigation link first
+              try {
+                const res = await odk.axios.get(link);
+                const data = res && res.data;
+                const vals = Array.isArray(data) ? data : (data && data.value) ? data.value : (data ? [data] : []);
+                children[childName] = vals;
+                return;
+              } catch (err) {
+                logger.debug({ err, link, childName }, 'navLink fetch failed, will try fallback');
+              }
+
+              // fallback: construct per-instance child endpoint
+              if (rawId && odk.buildSubmissionsUrl) {
+                try {
+                  const encodedId = encodeURIComponent(String(rawId));
+                  const perPath = odk.buildSubmissionsUrl(process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL, projectId, formId, `('${encodedId}')/${childName}`);
+                  const res2 = await odk.axios.get(perPath);
+                  const data2 = res2 && res2.data;
+                  const vals2 = Array.isArray(data2) ? data2 : (data2 && data2.value) ? data2.value : (data2 ? [data2] : []);
+                  children[childName] = vals2;
+                  return;
+                } catch (err2) {
+                  logger.warn({ err2, childName }, 'fallback child fetch failed');
+                }
+              }
+            }));
+          }
+          await Promise.all(tasks);
+          return children;
+        }
+
+        // hydrate children found via @odata.navigationLink when present
+        try {
+          const navChildren = await fetchNavigationChildren(record, rawId);
+          for (const cn of Object.keys(navChildren)) {
+            // attach children array under its property name if not already present
+            if (!record[cn] || !Array.isArray(record[cn])) record[cn] = navChildren[cn];
+          }
+        } catch (err) {
+          logger.warn({ err }, 'navigationLink hydration failed');
+        }
+
         // determine submittedAt from the detailed record if possible
         let submittedAt = null;
         if (record.__system) submittedAt = record.__system.submissionDate || record.__system.createdAt;
@@ -227,7 +315,27 @@ async function runOnce() {
         if (since && submittedAt <= since) return;
         if (submittedAt > maxSeen) maxSeen = submittedAt;
 
-        await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record);
+        // If record looks like the lightweight listing row (only __system),
+        // try one more direct per-instance fetch without encoding/expanding.
+        function isLightweight(rec) {
+          if (!rec || typeof rec !== 'object') return false;
+          const keys = Object.keys(rec).filter(k => k !== '__system' && k !== '__id' && k !== '_id');
+          return keys.length === 0 && rec.__system;
+        }
+
+        if (rawId && isLightweight(record)) {
+          try {
+            const q = `?$filter=__id eq '${String(rawId)}'`;
+            const detail = await odk.fetchSubmissions(projectId, formId, q);
+            if (detail && Array.isArray(detail)) record = detail[0] || record;
+            else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
+            else if (detail && typeof detail === 'object') record = detail;
+          } catch (err) {
+            logger.debug({ err, rawId }, 'final per-instance fetch fallback failed');
+          }
+        }
+
+        await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record, { skipMedia: opts.skipMedia, dryRun: opts.dryRun });
       } catch (err) {
         logger.error({ err }, 'processing submission failed');
       }
