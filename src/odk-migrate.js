@@ -10,6 +10,9 @@ const pino = require('pino');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const stream = require('stream');
 const { promisify } = require('util');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 const pipeline = promisify(stream.pipeline);
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
@@ -40,37 +43,59 @@ async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
       if (!contentType) contentType = streamBody.headers['content-type'] || streamBody.headers['Content-Type'];
     }
   }
+
   const pass = new stream.PassThrough();
   actualStream.pipe(pass);
-  const params = { Bucket: bucket, Key: key, Body: pass, ContentType: contentType };
+  const acl = process.env.S3_PUBLIC_ACL || 'public-read';
+  const params = { Bucket: bucket, Key: key, Body: pass, ContentType: contentType, ACL: acl };
   if (contentLength) {
     const n = parseInt(contentLength, 10);
     if (!isNaN(n)) params.ContentLength = n;
   }
-  const cmd = new PutObjectCommand(params);
-  await s3client.send(cmd);
-  // prefer returning a CDN public URL if configured
+
+  // Try upload directly; if it fails and we don't have content-length, fallback to buffering
+  try {
+    const cmd = new PutObjectCommand(params);
+    await s3client.send(cmd);
+    return buildPublicUrl(bucket, key);
+  } catch (err) {
+    if (contentLength) throw err;
+    // fallback: write stream to temp file to determine size
+    const tmpName = `odk_upload_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const tmpPath = path.join(os.tmpdir(), tmpName);
+    try {
+      await pipeline(actualStream, fs.createWriteStream(tmpPath));
+      const st = await fs.promises.stat(tmpPath);
+      const size = st.size;
+      const readStream = fs.createReadStream(tmpPath);
+      const params2 = { Bucket: bucket, Key: key, Body: readStream, ContentType: contentType, ContentLength: size, ACL: acl };
+      const cmd2 = new PutObjectCommand(params2);
+      await s3client.send(cmd2);
+      return buildPublicUrl(bucket, key);
+    } finally {
+      try { await fs.promises.unlink(tmpPath); } catch (e) { /* ignore */ }
+    }
+  }
+}
+
+function buildPublicUrl(bucket, key) {
   const useCdn = (process.env.S3_USE_CDN || '').toString().toLowerCase() === 'true';
   const cdn = process.env.S3_CDN;
   const publicTemplate = process.env.S3_PUBLIC_URL_TEMPLATE || '{cdn}/{key}';
-  const encodedKey = encodeURIComponent(key);
+  // encode each path segment but preserve slashes
+  const encodedKey = key.split('/').map(encodeURIComponent).join('/');
   if (useCdn && cdn) {
     return publicTemplate.replace('{cdn}', cdn).replace('{bucket}', bucket).replace('{key}', encodedKey);
   }
-
-  // construct a sane public URL when a custom S3 endpoint is provided (e.g. DigitalOcean Spaces)
   const endpoint = process.env.S3_ENDPOINT ? process.env.S3_ENDPOINT.replace(/\/$/, '') : null;
   if (endpoint) {
     const e = endpoint.replace(/^https?:\/\//, '');
-    // if endpoint contains a {bucket} or {key} token, allow templating
     if (endpoint.includes('{bucket}') || endpoint.includes('{key}')) {
       return endpoint.replace('{bucket}', bucket).replace('{key}', encodedKey);
     }
-    // common DigitalOcean pattern: use bucket as subdomain
     if (e.includes('digitaloceanspaces.com')) {
       return `https://${bucket}.${e}/${encodedKey}`;
     }
-    // fallback: endpoint/bucket/key
     return `${endpoint}/${bucket}/${encodedKey}`;
   }
   return `s3://${bucket}/${key}`;
