@@ -34,6 +34,30 @@ async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
   streamBody.pipe(pass);
   const cmd = new PutObjectCommand({ Bucket: bucket, Key: key, Body: pass, ContentType: contentType });
   await s3client.send(cmd);
+  // prefer returning a CDN public URL if configured
+  const useCdn = (process.env.S3_USE_CDN || '').toString().toLowerCase() === 'true';
+  const cdn = process.env.S3_CDN;
+  const publicTemplate = process.env.S3_PUBLIC_URL_TEMPLATE || '{cdn}/{key}';
+  const encodedKey = encodeURIComponent(key);
+  if (useCdn && cdn) {
+    return publicTemplate.replace('{cdn}', cdn).replace('{bucket}', bucket).replace('{key}', encodedKey);
+  }
+
+  // construct a sane public URL when a custom S3 endpoint is provided (e.g. DigitalOcean Spaces)
+  const endpoint = process.env.S3_ENDPOINT ? process.env.S3_ENDPOINT.replace(/\/$/, '') : null;
+  if (endpoint) {
+    const e = endpoint.replace(/^https?:\/\//, '');
+    // if endpoint contains a {bucket} or {key} token, allow templating
+    if (endpoint.includes('{bucket}') || endpoint.includes('{key}')) {
+      return endpoint.replace('{bucket}', bucket).replace('{key}', encodedKey);
+    }
+    // common DigitalOcean pattern: use bucket as subdomain
+    if (e.includes('digitaloceanspaces.com')) {
+      return `https://${bucket}.${e}/${encodedKey}`;
+    }
+    // fallback: endpoint/bucket/key
+    return `${endpoint}/${bucket}/${encodedKey}`;
+  }
   return `s3://${bucket}/${key}`;
 }
 
@@ -163,8 +187,20 @@ async function runOnce() {
   // s3 client if configured
   let s3client = null;
   const s3bucket = process.env.S3_BUCKET;
-  if (process.env.AWS_ACCESS_KEY_ID && s3bucket) {
-    s3client = new S3Client({ region: process.env.AWS_REGION });
+  const accessKey = process.env.AWS_ACCESS_KEY_ID;
+  const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
+  if (accessKey && secretKey && s3bucket) {
+    const s3Config = {
+      region: process.env.AWS_REGION || 'us-east-1',
+      credentials: { accessKeyId: accessKey, secretAccessKey: secretKey }
+    };
+    if (process.env.S3_ENDPOINT) {
+      s3Config.endpoint = process.env.S3_ENDPOINT.replace(/\/$/, '');
+      if (typeof process.env.S3_FORCE_PATH_STYLE !== 'undefined') {
+        s3Config.forcePathStyle = process.env.S3_FORCE_PATH_STYLE === 'true';
+      }
+    }
+    s3client = new S3Client(s3Config);
   }
 
   // determine since
