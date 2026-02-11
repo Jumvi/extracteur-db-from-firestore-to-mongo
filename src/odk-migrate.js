@@ -5,7 +5,7 @@ const util = require('util');
 let pLimit = require('p-limit');
 if (pLimit && typeof pLimit !== 'function' && pLimit.default) pLimit = pLimit.default;
 const { createOdkClient } = require('./odkClient');
-const { connect, getBucket, upsertSubmission, getSyncState, setSyncState } = require('./mongoClient');
+const { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState } = require('./mongoClient');
 const pino = require('pino');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const stream = require('stream');
@@ -30,9 +30,24 @@ program
 const opts = program.opts();
 
 async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
+  // streamBody may be either a plain stream or an object { stream, headers }
+  let actualStream = streamBody;
+  let contentLength = undefined;
+  if (streamBody && typeof streamBody === 'object' && streamBody.stream) {
+    actualStream = streamBody.stream;
+    if (streamBody.headers) {
+      contentLength = streamBody.headers['content-length'] || streamBody.headers['Content-Length'];
+      if (!contentType) contentType = streamBody.headers['content-type'] || streamBody.headers['Content-Type'];
+    }
+  }
   const pass = new stream.PassThrough();
-  streamBody.pipe(pass);
-  const cmd = new PutObjectCommand({ Bucket: bucket, Key: key, Body: pass, ContentType: contentType });
+  actualStream.pipe(pass);
+  const params = { Bucket: bucket, Key: key, Body: pass, ContentType: contentType };
+  if (contentLength) {
+    const n = parseInt(contentLength, 10);
+    if (!isNaN(n)) params.ContentLength = n;
+  }
+  const cmd = new PutObjectCommand(params);
   await s3client.send(cmd);
   // prefer returning a CDN public URL if configured
   const useCdn = (process.env.S3_USE_CDN || '').toString().toLowerCase() === 'true';
@@ -124,14 +139,14 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
     // attempt to download + store media (S3 or GridFS) unless skipMedia is set
     try {
       if (!skipMedia && instanceId) {
-        const mediaStream = await odk.downloadMedia(projectId, formId, instanceId, filename);
+        const mediaRes = await odk.downloadMedia(projectId, formId, instanceId, filename);
         if (s3client && s3bucket) {
           const key = `${formId}/${instanceId}/${filename}`;
-          const url = await uploadToS3(s3client, s3bucket, key, mediaStream, 'application/octet-stream');
+          const url = await uploadToS3(s3client, s3bucket, key, mediaRes, mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type']) || 'application/octet-stream');
           att.s3 = url;
           doc[`${fieldPath}_url`] = url;
         } else {
-          const res = await uploadToGridFS(bucket, `${formId}_${instanceId}_${filename}`, mediaStream);
+          const res = await uploadToGridFS(bucket, `${formId}_${instanceId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
           att.gridFs = res;
           doc[`${fieldPath}_gridfs`] = res;
         }
@@ -153,6 +168,8 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
     }
 
     attachments.push(att);
+    // log prepared attachment mapping for visibility
+    logger.info({ instanceId, formId, filename, fieldPath, attachment: att }, 'prepared attachment mapping');
   }
 
   if (attachments.length) doc.attachments = attachments;
@@ -165,6 +182,26 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
     console.log(util.inspect(doc, { depth: 5 }));
   } else {
     await upsertSubmission(formId, effectiveId || null, doc);
+    // verify persistence and that attachments are associated
+    try {
+      const saved = await getSubmission(formId, effectiveId || null);
+      if (!saved) {
+        logger.warn({ formId, instanceId: effectiveId }, 'upsert completed but document not found on verification');
+      } else {
+        const savedAttachments = Array.isArray(saved.attachments) ? saved.attachments : [];
+        for (const att of attachments) {
+          const match = savedAttachments.find(sa => sa.filename === att.filename);
+          if (match) {
+            const url = match.s3 || (match.gridFs && match.gridFs.filename) || match.proxyUrl || match.url || null;
+            logger.info({ formId, instanceId: effectiveId, filename: att.filename, url, match }, 'verified attachment persisted');
+          } else {
+            logger.warn({ formId, instanceId: effectiveId, filename: att.filename, savedAttachments }, 'attachment missing after upsert');
+          }
+        }
+      }
+    } catch (err) {
+      logger.error({ err, formId, instanceId: effectiveId }, 'verification query failed');
+    }
   }
 }
 

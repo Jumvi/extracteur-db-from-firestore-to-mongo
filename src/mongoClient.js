@@ -32,6 +32,13 @@ async function upsertSubmission(formId, instanceId, doc) {
   await col.replaceOne({ instanceId }, doc, { upsert: true });
 }
 
+async function getSubmission(formId, instanceId) {
+  await connect();
+  const col = db.collection(`odk_submissions_${formId}`);
+  const doc = await col.findOne({ instanceId });
+  return doc || null;
+}
+
 async function getSyncState(formId) {
   await connect();
   const col = db.collection('sync_state');
@@ -45,4 +52,4 @@ async function setSyncState(formId, lastSyncAt) {
   await col.updateOne({ formId }, { $set: { formId, lastSyncAt, updatedAt: new Date() } }, { upsert: true });
 }
 
-module.exports = { connect, getBucket, upsertSubmission, getSyncState, setSyncState };
+module.exports = { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState };

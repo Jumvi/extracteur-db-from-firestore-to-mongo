@@ -65,7 +65,7 @@ function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate, submis
     const url = buildMediaUrl(mediaTemplate, { projectId, formId, instanceId, filename }) ||
       `/projects/${projectId}/forms/${formId}/submissions/${instanceId}/attachments/${encodeURIComponent(filename)}`;
     const res = await ax.get(url, { responseType: 'stream' });
-    return res.data;
+    return { stream: res.data, headers: res.headers };
   }
 
   return { login, fetchSubmissions, downloadMedia, axios: ax, buildSubmissionsUrl };
