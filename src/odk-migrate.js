@@ -33,6 +33,7 @@ program
   .option('--no-hydrate-nav', 'disable @odata.navigationLink hydration')
   .option('--nav-depth <n>', 'navigationLink hydration max depth', parseInt, 4)
   .option('--nav-max-requests <n>', 'max navigationLink requests per submission', parseInt, 250)
+  .option('--media-concurrency <n>', 'max concurrent media downloads/uploads per submission', parseInt, 2)
   .option('--skip-media', 'do not download or store media')
   .option('--dry-run', 'print resulting documents instead of upserting')
   .option('--all', 'migrate all forms in the project')
@@ -222,7 +223,7 @@ async function hydrateNavigationLinks(root, odk, {
   return root;
 }
 
-async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission, { skipMedia = false, dryRun = false } = {}) {
+async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission, { skipMedia = false, dryRun = false, mediaConcurrency = 2 } = {}) {
   // robust instanceId detection across common property names
   function findInstanceId(obj) {
     if (!obj || typeof obj !== 'object') return null;
@@ -237,6 +238,21 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
 
   const instanceId = findInstanceId(submission) || null;
   const doc = { ...submission };
+  const effectiveId = instanceId || (doc && (doc.__id || doc._id || doc.id || doc.uuid || (doc.meta && (doc.meta.instanceID || doc.meta.instanceId))));
+  if (effectiveId) doc.instanceId = effectiveId;
+
+  // Resume optimization: if the document already exists, reuse stored attachment URLs
+  // so reruns after interruption don't re-download everything.
+  let existing = null;
+  if (!dryRun && effectiveId) {
+    try {
+      existing = await getSubmission(formId, effectiveId);
+    } catch (err) {
+      logger.debug({ err, formId, instanceId: effectiveId }, 'failed loading existing submission');
+    }
+  }
+  const existingAttachments = existing && Array.isArray(existing.attachments) ? existing.attachments : [];
+  const existingByFilename = new Map(existingAttachments.map(a => [a && a.filename, a]));
 
   // build proxy template
   const proxyTemplate = process.env.ODK_ATTACHMENT_PROXY_TEMPLATE || process.env.ODK_ATTACHMENT_PROXY || '/api/getAttachment?instanceId={instanceId}&filename={filename}';
@@ -244,60 +260,74 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
   // detect media and build attachments metadata
   const medias = detectMediaFields(submission);
   const attachments = [];
-  for (const m of medias) {
+
+  const mediaLimit = pLimit(Math.max(1, parseInt(mediaConcurrency, 10) || 1));
+  await Promise.all(medias.map(m => mediaLimit(async () => {
     const filename = m.filename;
     const fieldPath = m.path;
     const att = { filename, fieldPath };
 
     // build proxy URL (for frontend) if instanceId is available
-    if (instanceId) {
-      att.proxyUrl = proxyTemplate.replace('{instanceId}', encodeURIComponent(instanceId))
+    if (effectiveId) {
+      att.proxyUrl = proxyTemplate.replace('{instanceId}', encodeURIComponent(effectiveId))
         .replace('{filename}', encodeURIComponent(filename))
         .replace('{formId}', encodeURIComponent(formId))
         .replace('{projectId}', encodeURIComponent(projectId));
     }
 
+    // If we already uploaded this file before, reuse its URL
+    const prior = existingByFilename.get(filename);
+    if (prior && prior.s3) {
+      att.s3 = prior.s3;
+      doc[`${fieldPath}_url`] = prior.s3;
+      attachments.push(att);
+      return;
+    }
+    if (prior && prior.gridFs) {
+      att.gridFs = prior.gridFs;
+      doc[`${fieldPath}_gridfs`] = prior.gridFs;
+      attachments.push(att);
+      return;
+    }
+
     // attempt to download + store media (S3 or GridFS) unless skipMedia is set
     try {
-      if (!skipMedia && instanceId) {
-        const mediaRes = await odk.downloadMedia(projectId, formId, instanceId, filename);
+      if (!skipMedia && effectiveId) {
+        const mediaRes = await odk.downloadMedia(projectId, formId, effectiveId, filename);
         if (s3client && s3bucket) {
-          const key = `${formId}/${instanceId}/${filename}`;
-          const url = await uploadToS3(s3client, s3bucket, key, mediaRes, mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type']) || 'application/octet-stream');
+          const key = `${formId}/${effectiveId}/${filename}`;
+          const url = await uploadToS3(
+            s3client,
+            s3bucket,
+            key,
+            mediaRes,
+            (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream'
+          );
           att.s3 = url;
           doc[`${fieldPath}_url`] = url;
         } else {
-          const res = await uploadToGridFS(bucket, `${formId}_${instanceId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
+          const res = await uploadToGridFS(bucket, `${formId}_${effectiveId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
           att.gridFs = res;
           doc[`${fieldPath}_gridfs`] = res;
         }
       } else {
         // build proxy URL only (no binary transfer)
-        if (instanceId) {
-          att.proxyUrl = proxyTemplate.replace('{instanceId}', encodeURIComponent(instanceId))
-            .replace('{filename}', encodeURIComponent(filename))
-            .replace('{formId}', encodeURIComponent(formId))
-            .replace('{projectId}', encodeURIComponent(projectId));
-          // provide a lightweight url field so frontend can fetch the binary later
+        if (effectiveId) {
           doc[`${fieldPath}_url`] = att.proxyUrl;
         } else {
           logger.debug({ fieldPath, filename }, 'no instanceId, skipping media proxy');
         }
       }
     } catch (err) {
-      logger.error({ err, filename, instanceId }, 'media download/upload failed');
+      logger.error({ err, filename, instanceId: effectiveId }, 'media download/upload failed');
     }
 
     attachments.push(att);
-    // log prepared attachment mapping for visibility
-    logger.info({ instanceId, formId, filename, fieldPath, attachment: att }, 'prepared attachment mapping');
-  }
+    logger.info({ instanceId: effectiveId, formId, filename, fieldPath, attachment: att }, 'prepared attachment mapping');
+  })));
 
   if (attachments.length) doc.attachments = attachments;
 
-  // ensure we persist a stable instanceId in the document and use it as the upsert key
-  const effectiveId = instanceId || (doc && (doc.__id || doc._id || doc.id || doc.uuid || (doc.meta && (doc.meta.instanceID || doc.meta.instanceId))));
-  if (effectiveId) doc.instanceId = effectiveId;
   if (dryRun) {
     logger.info({ instanceId: effectiveId }, 'dry-run document:');
     console.log(util.inspect(doc, { depth: 5 }));
@@ -507,7 +537,7 @@ async function runOnce() {
         }
       }
 
-      await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record, { skipMedia: opts.skipMedia, dryRun: opts.dryRun });
+      await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record, { skipMedia: opts.skipMedia, dryRun: opts.dryRun, mediaConcurrency: opts.mediaConcurrency });
       return true;
     };
 
