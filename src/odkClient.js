@@ -61,6 +61,12 @@ function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate, submis
     return res.data;
   }
 
+  async function fetchForms(projectId) {
+    const path = `/projects/${projectId}/forms`;
+    const res = await ax.get(path);
+    return res.data;
+  }
+
   async function downloadMedia(projectId, formId, instanceId, filename) {
     const url = buildMediaUrl(mediaTemplate, { projectId, formId, instanceId, filename }) ||
       `/projects/${projectId}/forms/${formId}/submissions/${instanceId}/attachments/${encodeURIComponent(filename)}`;
@@ -68,7 +74,7 @@ function createOdkClient({ baseUrl, loginUrl, email, pass, mediaTemplate, submis
     return { stream: res.data, headers: res.headers };
   }
 
-  return { login, fetchSubmissions, downloadMedia, axios: ax, buildSubmissionsUrl };
+  return { login, fetchSubmissions, downloadMedia, axios: ax, buildSubmissionsUrl, fetchForms };
 }
 
 module.exports = { createOdkClient };

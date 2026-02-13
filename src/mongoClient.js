@@ -52,4 +52,10 @@ async function setSyncState(formId, lastSyncAt) {
   await col.updateOne({ formId }, { $set: { formId, lastSyncAt, updatedAt: new Date() } }, { upsert: true });
 }
 
-module.exports = { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState };
+async function clearSyncState(formId) {
+  await connect();
+  const col = db.collection('sync_state');
+  await col.deleteOne({ formId });
+}
+
+module.exports = { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState, clearSyncState };

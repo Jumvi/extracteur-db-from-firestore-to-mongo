@@ -5,7 +5,7 @@ const util = require('util');
 let pLimit = require('p-limit');
 if (pLimit && typeof pLimit !== 'function' && pLimit.default) pLimit = pLimit.default;
 const { createOdkClient } = require('./odkClient');
-const { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState } = require('./mongoClient');
+const { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState, clearSyncState } = require('./mongoClient');
 const pino = require('pino');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const stream = require('stream');
@@ -24,10 +24,18 @@ program
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
   .option('--pageSize <n>', 'page size', parseInt, 200)
+  .option('--limit <n>', 'max number of submissions to process per run', parseInt)
+  .option('--orderby <expr>', 'OData $orderby expression (e.g. "__system/submissionDate asc")', '')
+  .option('--reset-state', 'clear sync_state for this form before running')
+  .option('--ignore-state', 'do not read sync_state when determining --since')
   .option('--backwindow <secs>', 'backwindow seconds', parseInt, 10)
   .option('--expand <exp>', 'OData $expand value', '')
+  .option('--no-hydrate-nav', 'disable @odata.navigationLink hydration')
+  .option('--nav-depth <n>', 'navigationLink hydration max depth', parseInt, 4)
+  .option('--nav-max-requests <n>', 'max navigationLink requests per submission', parseInt, 250)
   .option('--skip-media', 'do not download or store media')
   .option('--dry-run', 'print resulting documents instead of upserting')
+  .option('--all', 'migrate all forms in the project')
   .parse(process.argv);
 
 const opts = program.opts();
@@ -124,6 +132,94 @@ function detectMediaFields(obj) {
   }
   walk(obj);
   return media;
+}
+
+function parseODataCollection(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.value)) return data.value;
+  // single object
+  if (typeof data === 'object') return [data];
+  return [];
+}
+
+async function hydrateNavigationLinks(root, odk, {
+  maxDepth = 4,
+  maxRequests = 250,
+  concurrency = 4,
+  resolveLink,
+} = {}) {
+  if (!root || typeof root !== 'object') return root;
+  if (maxDepth <= 0) return root;
+
+  const seenObjects = new WeakSet();
+  const seenLinks = new Set();
+  let requestCount = 0;
+  const limit = pLimit(concurrency);
+
+  async function fetchAndAttach(container, propName, linkKey, linkUrl, depthLeft) {
+    if (!linkUrl || requestCount >= maxRequests) return;
+    const finalUrl = typeof resolveLink === 'function' ? resolveLink(linkUrl) : linkUrl;
+    if (seenLinks.has(finalUrl)) return;
+    seenLinks.add(finalUrl);
+    requestCount += 1;
+
+    try {
+      const res = await odk.axios.get(finalUrl);
+      const vals = parseODataCollection(res && res.data);
+      if (vals && vals.length) {
+        // attach values under the property name while keeping the nav link key for traceability
+        container[propName] = vals;
+        // recursively hydrate within the fetched children if requested
+        if (depthLeft > 1) {
+          await Promise.all(vals.map(v => limit(() => walk(v, depthLeft - 1))));
+        }
+      } else {
+        // ensure property exists so downstream code can rely on it
+        if (typeof container[propName] === 'undefined') container[propName] = [];
+      }
+    } catch (err) {
+      logger.warn({ err, linkUrl, finalUrl, propName }, 'navigationLink fetch failed');
+      // leave as-is; downstream can still use the linkKey if needed
+    }
+  }
+
+  async function walk(node, depthLeft) {
+    if (!node || typeof node !== 'object') return;
+    if (seenObjects.has(node)) return;
+    seenObjects.add(node);
+
+    if (Array.isArray(node)) {
+      for (const it of node) {
+        await walk(it, depthLeft);
+      }
+      return;
+    }
+
+    // 1) resolve navigation links on this object
+    const tasks = [];
+    for (const key of Object.keys(node)) {
+      const m = key.match(/^(.+)@odata\.navigationLink$/);
+      if (!m) continue;
+      const propName = m[1];
+      const linkUrl = node[key];
+      tasks.push(limit(() => fetchAndAttach(node, propName, key, linkUrl, depthLeft)));
+    }
+    if (tasks.length) await Promise.all(tasks);
+
+    // 2) recurse into children
+    if (depthLeft <= 1) return;
+    for (const key of Object.keys(node)) {
+      const val = node[key];
+      if (!val || typeof val !== 'object') continue;
+      // do not recurse into the navLink string keys
+      if (key.endsWith('@odata.navigationLink')) continue;
+      await walk(val, depthLeft - 1);
+    }
+  }
+
+  await walk(root, maxDepth);
+  return root;
 }
 
 async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission, { skipMedia = false, dryRun = false } = {}) {
@@ -238,6 +334,8 @@ async function runOnce() {
   // disable per-instance $expand by default (empty string). Set via --expand if needed.
   const expand = opts.expand || '';
   const backwindow = (opts.backwindow || 10) * 1000;
+  const hardLimit = typeof opts.limit === 'number' && !isNaN(opts.limit) && opts.limit > 0 ? opts.limit : null;
+  const orderBy = (opts.orderby || '').trim() || (hardLimit ? '__system/submissionDate asc' : '');
 
   const odk = createOdkClient({ baseUrl: process.env.ODK_BASE_URL, loginUrl: process.env.ODK_LOGIN_URL, email: process.env.ODK_EMAIL, pass: process.env.ODK_PASS, mediaTemplate: process.env.MEDIA_URL_TEMPLATE, submissionsTemplate: process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL });
   await odk.login();
@@ -245,6 +343,11 @@ async function runOnce() {
   // mongo connection and bucket
   await connect();
   const gridfsBucket = getBucket();
+
+  if (opts.resetState) {
+    await clearSyncState(formId);
+    logger.info({ formId }, 'cleared sync_state for form');
+  }
 
   // s3 client if configured
   let s3client = null;
@@ -271,15 +374,36 @@ async function runOnce() {
     const d = Date.parse(opts.since);
     if (isNaN(d)) throw new Error('Invalid --since date');
     since = new Date(d - backwindow);
-  } else {
+  } else if (!opts.ignoreState) {
     const state = await getSyncState(formId);
     if (state && state.lastSyncAt) since = new Date(new Date(state.lastSyncAt).getTime() - backwindow);
+  }
+
+  // navigationLink URLs returned by OData are often relative to the .svc root.
+  // Resolve them against the current form service root so nested links (segments) can be fetched.
+  const submissionsTemplate = process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL;
+  const submissionsUrl = odk.buildSubmissionsUrl ? odk.buildSubmissionsUrl(submissionsTemplate, projectId, formId, '') : null;
+  const svcRoot = (() => {
+    if (!submissionsUrl) return null;
+    const s = String(submissionsUrl);
+    const idx = s.indexOf('.svc/');
+    if (idx !== -1) return s.slice(0, idx + 5);
+    // fallback: strip entity set name
+    return s.replace(/Submissions.*$/i, '').replace(/\?$/, '');
+  })();
+  function resolveNavLink(link) {
+    if (!link) return link;
+    const u = String(link);
+    if (/^https?:\/\//i.test(u)) return u;
+    if (u.startsWith('/')) return u;
+    if (svcRoot) return `${svcRoot}${u}`;
+    return u;
   }
 
   let skip = 0;
   let maxSeen = since ? new Date(since) : new Date(0);
   let more = true;
-  const limit = pLimit(4);
+  let processed = 0;
 
   // helper to build a lightweight listing query (only ids + system metadata)
   function buildListQstr() {
@@ -287,6 +411,7 @@ async function runOnce() {
     qs.push(`$select=${encodeURIComponent('__id,__system')}`);
     qs.push(`$top=${pageSize}`);
     qs.push(`$skip=${skip}`);
+    if (orderBy) qs.push(`$orderby=${encodeURIComponent(orderBy)}`);
     return qs.length ? `?${qs.join('&')}` : '';
   }
 
@@ -304,140 +429,113 @@ async function runOnce() {
     const items = Array.isArray(data) ? data : (data && data.value) ? data.value : [];
     if (!items.length) break;
 
-    await Promise.all(items.map(item => limit(async () => {
-      try {
-        // extract candidate id and submission date from lightweight row
-        const rawId = item.__id || item._id || item.id || item.instanceId || item.uuid;
-        let listedDate = null;
-        if (item.__system) {
-          listedDate = item.__system.submissionDate || item.__system.createdAt || item.__system.submissiontime || item.__system.timestamp;
-        }
-        // normalize listedDate
-        const listedAt = listedDate ? new Date(listedDate) : null;
-
-        // if we have a since and listedAt, skip early
-        if (since && listedAt && listedAt <= since) return;
-
-        // fetch full detail per-instance (with $expand) to get attachments and nested repeats
-        let record = item;
-        // per-instance hydration with $expand is disabled by default; only run if expand provided
-        if (rawId && expand) {
-          // ensure proper quoting/encoding for OData key - preserve uuid: prefix if present
-          const encodedId = encodeURIComponent(String(rawId));
-          const perQ = `('${encodedId}')?${`$expand=${encodeURIComponent(expand)}`}`;
-          try {
-            const detail = await odk.fetchSubmissions(projectId, formId, perQ);
-            if (detail && Array.isArray(detail)) record = detail[0] || record;
-            else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
-            else if (detail && typeof detail === 'object') record = detail;
-          } catch (err) {
-            logger.warn({ err, rawId }, 'failed fetching per-instance detail, falling back to list item');
-          }
-        }
-
-        // If per-instance $expand is disabled, attempt to fetch the full record using a collection filter
-        if (rawId && !expand) {
-          try {
-            const q = `?$filter=__id eq '${String(rawId)}'`;
-            const detail = await odk.fetchSubmissions(projectId, formId, q);
-            if (detail && Array.isArray(detail)) record = detail[0] || record;
-            else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
-            else if (detail && typeof detail === 'object') record = detail;
-          } catch (err) {
-            logger.debug({ err, rawId }, 'per-instance fetch with filter failed, will fallback');
-          }
-        }
-
-        // If per-instance $expand is disabled, try to hydrate nested repeats/children
-        async function fetchNavigationChildren(rec, rawId) {
-          if (!rec || typeof rec !== 'object') return {};
-          const children = {};
-          const limitNav = pLimit(4);
-          const tasks = [];
-          for (const k of Object.keys(rec)) {
-            // look for keys like 'childCollection@odata.navigationLink'
-            const m = k.match(/^(.+)@odata\.navigationLink$/);
-            if (!m) continue;
-            const childName = m[1];
-            const link = rec[k];
-            if (!link) continue;
-            tasks.push(limitNav(async () => {
-              // try the navigation link first
-              try {
-                const res = await odk.axios.get(link);
-                const data = res && res.data;
-                const vals = Array.isArray(data) ? data : (data && data.value) ? data.value : (data ? [data] : []);
-                children[childName] = vals;
-                return;
-              } catch (err) {
-                logger.debug({ err, link, childName }, 'navLink fetch failed, will try fallback');
-              }
-
-              // fallback: construct per-instance child endpoint
-              if (rawId && odk.buildSubmissionsUrl) {
-                try {
-                  const encodedId = encodeURIComponent(String(rawId));
-                  const perPath = odk.buildSubmissionsUrl(process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL, projectId, formId, `('${encodedId}')/${childName}`);
-                  const res2 = await odk.axios.get(perPath);
-                  const data2 = res2 && res2.data;
-                  const vals2 = Array.isArray(data2) ? data2 : (data2 && data2.value) ? data2.value : (data2 ? [data2] : []);
-                  children[childName] = vals2;
-                  return;
-                } catch (err2) {
-                  logger.warn({ err2, childName }, 'fallback child fetch failed');
-                }
-              }
-            }));
-          }
-          await Promise.all(tasks);
-          return children;
-        }
-
-        // hydrate children found via @odata.navigationLink when present
-        try {
-          const navChildren = await fetchNavigationChildren(record, rawId);
-          for (const cn of Object.keys(navChildren)) {
-            // attach children array under its property name if not already present
-            if (!record[cn] || !Array.isArray(record[cn])) record[cn] = navChildren[cn];
-          }
-        } catch (err) {
-          logger.warn({ err }, 'navigationLink hydration failed');
-        }
-
-        // determine submittedAt from the detailed record if possible
-        let submittedAt = null;
-        if (record.__system) submittedAt = record.__system.submissionDate || record.__system.createdAt;
-        if (!submittedAt) submittedAt = record.submittedAt || record.createdAt || record._submittedAt;
-        submittedAt = submittedAt ? new Date(submittedAt) : new Date();
-
-        if (since && submittedAt <= since) return;
-        if (submittedAt > maxSeen) maxSeen = submittedAt;
-
-        // If record looks like the lightweight listing row (only __system),
-        // try one more direct per-instance fetch without encoding/expanding.
-        function isLightweight(rec) {
-          if (!rec || typeof rec !== 'object') return false;
-          const keys = Object.keys(rec).filter(k => k !== '__system' && k !== '__id' && k !== '_id');
-          return keys.length === 0 && rec.__system;
-        }
-
-        if (rawId && isLightweight(record)) {
-          try {
-            const q = `?$filter=__id eq '${String(rawId)}'`;
-            const detail = await odk.fetchSubmissions(projectId, formId, q);
-            if (detail && Array.isArray(detail)) record = detail[0] || record;
-            else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
-            else if (detail && typeof detail === 'object') record = detail;
-          } catch (err) {
-            logger.debug({ err, rawId }, 'final per-instance fetch fallback failed');
-          }
-        }
-
-        await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record, { skipMedia: opts.skipMedia, dryRun: opts.dryRun });
-      } catch (err) {
-        logger.error({ err }, 'processing submission failed');
+    // If a hard limit is requested, process sequentially for deterministic cutoff.
+    const processOne = async (item) => {
+      // extract candidate id and submission date from lightweight row
+      const rawId = item.__id || item._id || item.id || item.instanceId || item.uuid;
+      let listedDate = null;
+      if (item.__system) {
+        listedDate = item.__system.submissionDate || item.__system.createdAt || item.__system.submissiontime || item.__system.timestamp;
       }
-    })));
+      const listedAt = listedDate ? new Date(listedDate) : null;
+      if (since && listedAt && listedAt <= since) return false;
+
+      // fetch full detail per-instance (with $expand) to get attachments and nested repeats
+      let record = item;
+      if (rawId && expand) {
+        const encodedId = encodeURIComponent(String(rawId));
+        const perQ = `('${encodedId}')?${`$expand=${encodeURIComponent(expand)}`}`;
+        try {
+          const detail = await odk.fetchSubmissions(projectId, formId, perQ);
+          if (detail && Array.isArray(detail)) record = detail[0] || record;
+          else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
+          else if (detail && typeof detail === 'object') record = detail;
+        } catch (err) {
+          logger.warn({ err, rawId }, 'failed fetching per-instance detail, falling back to list item');
+        }
+      }
+
+      if (rawId && !expand) {
+        try {
+          const q = `?$filter=__id eq '${String(rawId)}'`;
+          const detail = await odk.fetchSubmissions(projectId, formId, q);
+          if (detail && Array.isArray(detail)) record = detail[0] || record;
+          else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
+          else if (detail && typeof detail === 'object') record = detail;
+        } catch (err) {
+          logger.debug({ err, rawId }, 'per-instance fetch with filter failed, will fallback');
+        }
+      }
+
+      // Determine submittedAt from the detailed record if possible
+      let submittedAt = null;
+      if (record && record.__system) submittedAt = record.__system.submissionDate || record.__system.createdAt;
+      if (!submittedAt) submittedAt = record && (record.submittedAt || record.createdAt || record._submittedAt);
+      submittedAt = submittedAt ? new Date(submittedAt) : new Date();
+      if (since && submittedAt <= since) return false;
+      if (submittedAt > maxSeen) maxSeen = submittedAt;
+
+      // If record looks lightweight, try one more direct per-instance fetch
+      function isLightweight(rec) {
+        if (!rec || typeof rec !== 'object') return false;
+        const keys = Object.keys(rec).filter(k => k !== '__system' && k !== '__id' && k !== '_id');
+        return keys.length === 0 && rec.__system;
+      }
+      if (rawId && isLightweight(record)) {
+        try {
+          const q = `?$filter=__id eq '${String(rawId)}'`;
+          const detail = await odk.fetchSubmissions(projectId, formId, q);
+          if (detail && Array.isArray(detail)) record = detail[0] || record;
+          else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
+          else if (detail && typeof detail === 'object') record = detail;
+        } catch (err) {
+          logger.debug({ err, rawId }, 'final per-instance fetch fallback failed');
+        }
+      }
+
+      // NEW: recursively hydrate @odata.navigationLink at any depth (segments, repeats)
+      if (opts.hydrateNav !== false) {
+        try {
+          await hydrateNavigationLinks(record, odk, {
+            maxDepth: opts.navDepth || 4,
+            maxRequests: opts.navMaxRequests || 250,
+            concurrency: 4,
+            resolveLink: resolveNavLink,
+          });
+        } catch (err) {
+          logger.warn({ err, rawId }, 'recursive navigationLink hydration failed');
+        }
+      }
+
+      await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, record, { skipMedia: opts.skipMedia, dryRun: opts.dryRun });
+      return true;
+    };
+
+    if (hardLimit) {
+      for (const item of items) {
+        if (processed >= hardLimit) {
+          more = false;
+          break;
+        }
+        try {
+          const did = await processOne(item);
+          if (did) processed += 1;
+        } catch (err) {
+          logger.error({ err }, 'processing submission failed');
+        }
+      }
+      // If we hit the hard limit, stop paging
+      if (!more) break;
+    } else {
+      const limit = pLimit(4);
+      await Promise.all(items.map(item => limit(async () => {
+        try {
+          await processOne(item);
+        } catch (err) {
+          logger.error({ err }, 'processing submission failed');
+        }
+      })));
+    }
 
     if (items.length < pageSize) more = false; else skip += pageSize;
   }
@@ -448,10 +546,54 @@ async function runOnce() {
   }
 }
 
+async function runAll() {
+  const projectId = opts.project;
+  const odk = createOdkClient({ baseUrl: process.env.ODK_BASE_URL, loginUrl: process.env.ODK_LOGIN_URL, email: process.env.ODK_EMAIL, pass: process.env.ODK_PASS, mediaTemplate: process.env.MEDIA_URL_TEMPLATE, submissionsTemplate: process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL });
+  await odk.login();
+  let forms;
+  try {
+    forms = await odk.fetchForms(projectId);
+  } catch (err) {
+    logger.error({ err }, 'failed fetching forms list');
+    throw err;
+  }
+  const list = Array.isArray(forms) ? forms : (forms && forms.value) ? forms.value : [];
+  for (const f of list) {
+    // attempt to extract a sensible formId
+    const formId = f.xmlFormId || f.formId || f.id || f.xformId || f.name || f.title;
+    if (!formId) {
+      logger.warn({ f }, 'unable to determine form id for entry, skipping');
+      continue;
+    }
+    logger.info({ formId }, 'starting runOnce for form');
+    // set opts.form so runOnce uses it
+    opts.form = formId;
+    try {
+      await runOnce();
+    } catch (err) {
+      logger.error({ err, formId }, 'runOnce failed for form');
+    }
+  }
+}
+
 async function main() {
+  if (opts.once && opts.all) {
+    await runAll();
+    process.exit(0);
+  }
   if (opts.once) {
     await runOnce();
     process.exit(0);
+  }
+  if (opts.daemon && opts.all) {
+    while (true) {
+      try {
+        await runAll();
+      } catch (err) {
+        logger.error({ err }, 'runAll failed in daemon');
+      }
+      await new Promise(r => setTimeout(r, 60 * 1000));
+    }
   }
   if (opts.daemon) {
     while (true) {
