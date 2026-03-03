@@ -17,29 +17,88 @@ const path = require('path');
 const pipeline = promisify(stream.pipeline);
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+function parseInt10(v) {
+  const n = Number.parseInt(String(v), 10);
+  if (Number.isNaN(n)) throw new Error(`Invalid integer: ${v}`);
+  return n;
+}
+
 program
   .option('--form <formId>', 'form id to sync')
   .option('--project <projectId>', 'ODK project id', process.env.ODK_PROJECT || '1')
   .option('--since <iso>', 'ISO date to fetch since')
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
-  .option('--pageSize <n>', 'page size', parseInt, 200)
-  .option('--limit <n>', 'max number of submissions to process per run', parseInt)
+  .option('--pageSize <n>', 'page size', parseInt10, 200)
+  .option('--limit <n>', 'max number of submissions to process per run', parseInt10)
   .option('--orderby <expr>', 'OData $orderby expression (e.g. "__system/submissionDate asc")', '')
   .option('--reset-state', 'clear sync_state for this form before running')
   .option('--ignore-state', 'do not read sync_state when determining --since')
-  .option('--backwindow <secs>', 'backwindow seconds', parseInt, 10)
+  .option('--backwindow <secs>', 'backwindow seconds', parseInt10, 10)
   .option('--expand <exp>', 'OData $expand value', '')
   .option('--no-hydrate-nav', 'disable @odata.navigationLink hydration')
-  .option('--nav-depth <n>', 'navigationLink hydration max depth', parseInt, 4)
-  .option('--nav-max-requests <n>', 'max navigationLink requests per submission', parseInt, 250)
-  .option('--media-concurrency <n>', 'max concurrent media downloads/uploads per submission', parseInt, 2)
+  .option('--nav-depth <n>', 'navigationLink hydration max depth', parseInt10, 4)
+  .option('--nav-max-requests <n>', 'max navigationLink requests per submission', parseInt10, 250)
+  .option('--strip-navlinks', 'delete "@odata.navigationLink" keys after successful hydration')
+  .option('--exclude-tests', 'skip submissions where type_donnee is test/tests (default: true unless --include-tests)')
+  .option('--include-tests', 'do not skip test submissions')
+  .option('--media-concurrency <n>', 'max concurrent media downloads/uploads per submission', parseInt10, 2)
   .option('--skip-media', 'do not download or store media')
   .option('--dry-run', 'print resulting documents instead of upserting')
   .option('--all', 'migrate all forms in the project')
   .parse(process.argv);
 
 const opts = program.opts();
+
+function shouldExcludeTests() {
+  if (opts.includeTests) return false;
+  if (opts.excludeTests) return true;
+  const env = (process.env.ODK_EXCLUDE_TESTS || '').toString().toLowerCase().trim();
+  if (!env) return false;
+  return env === '1' || env === 'true' || env === 'yes' || env === 'y';
+}
+
+function isTestValue(v) {
+  if (v === null || typeof v === 'undefined') return false;
+  if (typeof v !== 'string') return false;
+  const s = v.trim().toLowerCase();
+  return s === 'test' || s === 'tests';
+}
+
+function isTestSubmission(record) {
+  if (!record || typeof record !== 'object') return false;
+  const g = record.group_02;
+  if (g && typeof g === 'object') {
+    if (isTestValue(g.type_donnee)) return true;
+    if (isTestValue(g.type_donnee_save)) return true;
+  }
+  // fallback: some forms may have the flag at the root
+  if (isTestValue(record.type_donnee)) return true;
+  if (isTestValue(record.type_donnee_save)) return true;
+  return false;
+}
+
+function normalizeInstanceId(id) {
+  if (id === null || typeof id === 'undefined') return null;
+  let s = String(id);
+  // Some OData responses already include percent-encoded ids (e.g. "uuid%3A...").
+  // Decode once so we can re-encode deterministically (avoids double-encoding).
+  if (/%[0-9A-Fa-f]{2}/.test(s)) {
+    try { s = decodeURIComponent(s); } catch (e) { /* ignore */ }
+  }
+  return s;
+}
+
+function encodeInstanceIdOnce(id) {
+  const normalized = normalizeInstanceId(id);
+  if (!normalized) return '';
+  return encodeURIComponent(normalized);
+}
+
+function escapeODataStringLiteral(v) {
+  // OData string literal escaping: single quote doubled
+  return String(v).replace(/'/g, "''");
+}
 
 async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
   // streamBody may be either a plain stream or an object { stream, headers }
@@ -53,37 +112,33 @@ async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
     }
   }
 
-  const pass = new stream.PassThrough();
-  actualStream.pipe(pass);
   const acl = process.env.S3_PUBLIC_ACL || 'public-read';
-  const params = { Bucket: bucket, Key: key, Body: pass, ContentType: contentType, ACL: acl };
+  // If we know the size, stream directly. Otherwise buffer once to a temp file.
+  // (Important: we must not try to read the same stream twice.)
   if (contentLength) {
+    const pass = new stream.PassThrough();
+    actualStream.pipe(pass);
+    const params = { Bucket: bucket, Key: key, Body: pass, ContentType: contentType, ACL: acl };
     const n = parseInt(contentLength, 10);
     if (!isNaN(n)) params.ContentLength = n;
-  }
-
-  // Try upload directly; if it fails and we don't have content-length, fallback to buffering
-  try {
     const cmd = new PutObjectCommand(params);
     await s3client.send(cmd);
     return buildPublicUrl(bucket, key);
-  } catch (err) {
-    if (contentLength) throw err;
-    // fallback: write stream to temp file to determine size
-    const tmpName = `odk_upload_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    const tmpPath = path.join(os.tmpdir(), tmpName);
-    try {
-      await pipeline(actualStream, fs.createWriteStream(tmpPath));
-      const st = await fs.promises.stat(tmpPath);
-      const size = st.size;
-      const readStream = fs.createReadStream(tmpPath);
-      const params2 = { Bucket: bucket, Key: key, Body: readStream, ContentType: contentType, ContentLength: size, ACL: acl };
-      const cmd2 = new PutObjectCommand(params2);
-      await s3client.send(cmd2);
-      return buildPublicUrl(bucket, key);
-    } finally {
-      try { await fs.promises.unlink(tmpPath); } catch (e) { /* ignore */ }
-    }
+  }
+
+  const tmpName = `odk_upload_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const tmpPath = path.join(os.tmpdir(), tmpName);
+  try {
+    await pipeline(actualStream, fs.createWriteStream(tmpPath));
+    const st = await fs.promises.stat(tmpPath);
+    const size = st.size;
+    const readStream = fs.createReadStream(tmpPath);
+    const params2 = { Bucket: bucket, Key: key, Body: readStream, ContentType: contentType, ContentLength: size, ACL: acl };
+    const cmd2 = new PutObjectCommand(params2);
+    await s3client.send(cmd2);
+    return buildPublicUrl(bucket, key);
+  } finally {
+    try { await fs.promises.unlink(tmpPath); } catch (e) { /* ignore */ }
   }
 }
 
@@ -158,26 +213,43 @@ async function hydrateNavigationLinks(root, odk, {
   let requestCount = 0;
   const limit = pLimit(concurrency);
 
+  function getNextLink(data) {
+    if (!data || typeof data !== 'object') return null;
+    return data['@odata.nextLink'] || data['@odata.nextlink'] || data.nextLink || null;
+  }
+
   async function fetchAndAttach(container, propName, linkKey, linkUrl, depthLeft) {
     if (!linkUrl || requestCount >= maxRequests) return;
     const finalUrl = typeof resolveLink === 'function' ? resolveLink(linkUrl) : linkUrl;
     if (seenLinks.has(finalUrl)) return;
     seenLinks.add(finalUrl);
-    requestCount += 1;
 
     try {
-      const res = await odk.axios.get(finalUrl);
-      const vals = parseODataCollection(res && res.data);
-      if (vals && vals.length) {
-        // attach values under the property name while keeping the nav link key for traceability
-        container[propName] = vals;
-        // recursively hydrate within the fetched children if requested
-        if (depthLeft > 1) {
-          await Promise.all(vals.map(v => limit(() => walk(v, depthLeft - 1))));
-        }
-      } else {
-        // ensure property exists so downstream code can rely on it
-        if (typeof container[propName] === 'undefined') container[propName] = [];
+      const allVals = [];
+      let pageUrl = finalUrl;
+      while (pageUrl && requestCount < maxRequests) {
+        requestCount += 1;
+        const res = await odk.axios.get(pageUrl);
+        const vals = parseODataCollection(res && res.data);
+        if (vals && vals.length) allVals.push(...vals);
+
+        const nextRaw = getNextLink(res && res.data);
+        if (!nextRaw) break;
+        const nextUrl = typeof resolveLink === 'function' ? resolveLink(nextRaw) : nextRaw;
+        if (seenLinks.has(nextUrl)) break;
+        seenLinks.add(nextUrl);
+        pageUrl = nextUrl;
+      }
+
+      // attach values under the property name while keeping the nav link key for traceability
+      container[propName] = allVals;
+      if (opts.stripNavlinks) {
+        try { delete container[linkKey]; } catch (e) { /* ignore */ }
+      }
+
+      // recursively hydrate within the fetched children if requested
+      if (depthLeft > 1 && allVals.length) {
+        await Promise.all(allVals.map(v => limit(() => walk(v, depthLeft - 1))));
       }
     } catch (err) {
       logger.warn({ err, linkUrl, finalUrl, propName }, 'navigationLink fetch failed');
@@ -442,6 +514,12 @@ async function runOnce() {
     qs.push(`$top=${pageSize}`);
     qs.push(`$skip=${skip}`);
     if (orderBy) qs.push(`$orderby=${encodeURIComponent(orderBy)}`);
+    if (since && opts.serverFilterSince !== false) {
+      // ODK Central OData accepts ISO timestamps directly, and also quoted.
+      // We prefer unquoted to keep query shorter.
+      const expr = `__system/submissionDate gt ${since.toISOString()}`;
+      qs.push(`$filter=${encodeURIComponent(expr)}`);
+    }
     return qs.length ? `?${qs.join('&')}` : '';
   }
 
@@ -463,6 +541,7 @@ async function runOnce() {
     const processOne = async (item) => {
       // extract candidate id and submission date from lightweight row
       const rawId = item.__id || item._id || item.id || item.instanceId || item.uuid;
+      const normalizedId = rawId ? normalizeInstanceId(rawId) : null;
       let listedDate = null;
       if (item.__system) {
         listedDate = item.__system.submissionDate || item.__system.createdAt || item.__system.submissiontime || item.__system.timestamp;
@@ -472,8 +551,8 @@ async function runOnce() {
 
       // fetch full detail per-instance (with $expand) to get attachments and nested repeats
       let record = item;
-      if (rawId && expand) {
-        const encodedId = encodeURIComponent(String(rawId));
+      if (normalizedId && expand) {
+        const encodedId = encodeInstanceIdOnce(normalizedId);
         const perQ = `('${encodedId}')?${`$expand=${encodeURIComponent(expand)}`}`;
         try {
           const detail = await odk.fetchSubmissions(projectId, formId, perQ);
@@ -481,13 +560,14 @@ async function runOnce() {
           else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
           else if (detail && typeof detail === 'object') record = detail;
         } catch (err) {
-          logger.warn({ err, rawId }, 'failed fetching per-instance detail, falling back to list item');
+          logger.warn({ err, rawId, normalizedId, perQ }, 'failed fetching per-instance detail, falling back to list item');
         }
       }
 
-      if (rawId && !expand) {
+      if (normalizedId && !expand) {
         try {
-          const q = `?$filter=__id eq '${String(rawId)}'`;
+          const filterExpr = `__id eq '${escapeODataStringLiteral(normalizedId)}'`;
+          const q = `?$filter=${encodeURIComponent(filterExpr)}`;
           const detail = await odk.fetchSubmissions(projectId, formId, q);
           if (detail && Array.isArray(detail)) record = detail[0] || record;
           else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;
@@ -505,6 +585,12 @@ async function runOnce() {
       if (since && submittedAt <= since) return false;
       if (submittedAt > maxSeen) maxSeen = submittedAt;
 
+      // Skip test submissions but still advance maxSeen so sync_state progresses.
+      if (shouldExcludeTests() && isTestSubmission(record)) {
+        logger.info({ formId, instanceId: normalizedId || rawId || null }, 'skipping test submission (type_donnee=test/tests)');
+        return false;
+      }
+
       // If record looks lightweight, try one more direct per-instance fetch
       function isLightweight(rec) {
         if (!rec || typeof rec !== 'object') return false;
@@ -513,7 +599,8 @@ async function runOnce() {
       }
       if (rawId && isLightweight(record)) {
         try {
-          const q = `?$filter=__id eq '${String(rawId)}'`;
+          const filterExpr = `__id eq '${escapeODataStringLiteral(normalizedId || rawId)}'`;
+          const q = `?$filter=${encodeURIComponent(filterExpr)}`;
           const detail = await odk.fetchSubmissions(projectId, formId, q);
           if (detail && Array.isArray(detail)) record = detail[0] || record;
           else if (detail && detail.value && Array.isArray(detail.value)) record = detail.value[0] || record;

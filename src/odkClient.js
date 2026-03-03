@@ -7,7 +7,8 @@ function buildMediaUrl(template, params) {
   if (!template) return null;
   return template.replace('{projectId}', params.projectId)
     .replace('{formId}', params.formId)
-    .replace('{instanceId}', params.instanceId)
+    // instanceId is a path segment and may contain ':' (e.g. uuid:...), so encode it
+    .replace('{instanceId}', encodeURIComponent(params.instanceId))
     .replace('{filename}', encodeURIComponent(params.filename));
 }
 
