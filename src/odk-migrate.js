@@ -27,6 +27,7 @@ program
   .option('--form <formId>', 'form id to sync')
   .option('--project <projectId>', 'ODK project id', process.env.ODK_PROJECT || '1')
   .option('--since <iso>', 'ISO date to fetch since')
+  .option('--no-server-filter-since', 'do not send $filter __system/submissionDate gt ...; filter client-side only')
   .option('--instance <instanceId>', 'process only a specific submission instanceId (__id)')
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
@@ -39,9 +40,12 @@ program
   .option('--expand <exp>', 'OData $expand value', '')
   .option('--no-hydrate-nav', 'disable @odata.navigationLink hydration')
   .option('--nav-depth <n>', 'navigationLink hydration max depth', parseInt10, 4)
+  .option('--nav-concurrency <n>', 'max concurrent navigationLink requests per submission', parseInt10, 6)
   .option('--nav-max-requests <n>', 'max navigationLink requests per submission', parseInt10, 250)
   .option('--nav-timeout-ms <n>', 'hard timeout per navigationLink request (ms)', parseInt10, 60000)
+  .option('--nav-budget-ms <n>', 'total time budget for navigationLink hydration per submission (ms)', parseInt10, 120000)
   .option('--strip-navlinks', 'delete "@odata.navigationLink" keys after successful hydration')
+  .option('--no-diff', 'disable differential mode (skip unchanged submissions)')
   .option('--exclude-tests', 'skip submissions where type_donnee is test/tests (default: true unless --include-tests)')
   .option('--include-tests', 'do not skip test submissions')
   .option('--media-concurrency <n>', 'max concurrent media downloads/uploads per submission', parseInt10, 2)
@@ -100,6 +104,34 @@ function encodeInstanceIdOnce(id) {
 function escapeODataStringLiteral(v) {
   // OData string literal escaping: single quote doubled
   return String(v).replace(/'/g, "''");
+}
+
+function isLeapYear(y) {
+  return (y % 4 === 0 && y % 100 !== 0) || (y % 400 === 0);
+}
+
+function parseSinceInput(raw) {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed) return null;
+
+  // Accept YYYY-MM-DD and treat as UTC midnight.
+  const dateOnly = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const iso = dateOnly ? `${trimmed}T00:00:00Z` : trimmed;
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) {
+    // Special-case Feb 29 on non-leap years to provide a helpful hint.
+    const m = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (m) {
+      const y = Number(m[1]);
+      const mo = Number(m[2]);
+      const d = Number(m[3]);
+      if (mo === 2 && d === 29 && !isLeapYear(y)) {
+        throw new Error(`Invalid --since date (${trimmed}): ${y} is not a leap year. Use ${y}-02-28 (or a leap year like 2024-02-29).`);
+      }
+    }
+    throw new Error(`Invalid --since date (${trimmed}). Use ISO 8601 like 2026-02-28 or 2026-02-28T00:00:00Z.`);
+  }
+  return new Date(ms);
 }
 
 async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
@@ -207,6 +239,7 @@ async function hydrateNavigationLinks(root, odk, {
   concurrency = 4,
   resolveLink,
   requestTimeoutMs = 60000,
+  timeBudgetMs = 120000,
 } = {}) {
   if (!root || typeof root !== 'object') return root;
   // maxDepth here represents how many *fetch hops* we allow when following navLinks.
@@ -217,9 +250,22 @@ async function hydrateNavigationLinks(root, odk, {
 
   const seenObjects = new WeakSet();
   const seenLinks = new Set();
+  const linkCache = new Map();
   let requestCount = 0;
   let hydratedCount = 0;
   const limit = pLimit(concurrency);
+  const startedAt = Date.now();
+  const deadlineAt = timeBudgetMs && timeBudgetMs > 0 ? (startedAt + timeBudgetMs) : null;
+
+  function remainingBudgetMs() {
+    if (!deadlineAt) return null;
+    return Math.max(0, deadlineAt - Date.now());
+  }
+
+  function budgetExceeded() {
+    if (!timeBudgetMs || timeBudgetMs <= 0) return false;
+    return (Date.now() - startedAt) >= timeBudgetMs;
+  }
 
   function getNextLink(data) {
     if (!data || typeof data !== 'object') return null;
@@ -228,34 +274,53 @@ async function hydrateNavigationLinks(root, odk, {
 
   async function fetchAndAttach(container, propName, linkKey, linkUrl, depthLeft) {
     if (!linkUrl || requestCount >= maxRequests) return;
+    if (budgetExceeded()) return;
     const finalUrl = typeof resolveLink === 'function' ? resolveLink(linkUrl) : linkUrl;
-    if (seenLinks.has(finalUrl)) return;
-    seenLinks.add(finalUrl);
+
+    // Deduplicate by URL, but still attach results everywhere this URL appears.
+    // We cache the *promise* so multiple callers share the same in-flight work.
+    let promise = linkCache.get(finalUrl);
+    if (!promise) {
+      promise = (async () => {
+        if (seenLinks.has(finalUrl)) return [];
+        seenLinks.add(finalUrl);
+
+        const allVals = [];
+        let pageUrl = finalUrl;
+        while (pageUrl && requestCount < maxRequests) {
+          if (budgetExceeded()) break;
+          const remaining = remainingBudgetMs();
+          if (remaining !== null && remaining <= 0) break;
+          requestCount += 1;
+          logger.info({ propName, pageUrl, requestCount, requestTimeoutMs }, 'fetching navigationLink');
+          const controller = new AbortController();
+          const hard = Math.max(1, requestTimeoutMs || 60000);
+          const effectiveTimeout = remaining !== null ? Math.max(1, Math.min(hard, remaining)) : hard;
+          const to = setTimeout(() => controller.abort(), effectiveTimeout);
+          let res;
+          try {
+            res = await odk.axios.get(pageUrl, { signal: controller.signal });
+          } finally {
+            clearTimeout(to);
+          }
+          const vals = parseODataCollection(res && res.data);
+          if (vals && vals.length) allVals.push(...vals);
+
+          const nextRaw = getNextLink(res && res.data);
+          if (!nextRaw) break;
+          const nextUrl = typeof resolveLink === 'function' ? resolveLink(nextRaw) : nextRaw;
+          if (seenLinks.has(nextUrl)) break;
+          seenLinks.add(nextUrl);
+          pageUrl = nextUrl;
+        }
+        return allVals;
+      })();
+
+      linkCache.set(finalUrl, promise);
+    }
 
     try {
-      const allVals = [];
-      let pageUrl = finalUrl;
-      while (pageUrl && requestCount < maxRequests) {
-        requestCount += 1;
-        logger.info({ propName, pageUrl, requestCount, requestTimeoutMs }, 'fetching navigationLink');
-        const controller = new AbortController();
-        const to = setTimeout(() => controller.abort(), Math.max(1, requestTimeoutMs || 60000));
-        let res;
-        try {
-          res = await odk.axios.get(pageUrl, { signal: controller.signal });
-        } finally {
-          clearTimeout(to);
-        }
-        const vals = parseODataCollection(res && res.data);
-        if (vals && vals.length) allVals.push(...vals);
-
-        const nextRaw = getNextLink(res && res.data);
-        if (!nextRaw) break;
-        const nextUrl = typeof resolveLink === 'function' ? resolveLink(nextRaw) : nextRaw;
-        if (seenLinks.has(nextUrl)) break;
-        seenLinks.add(nextUrl);
-        pageUrl = nextUrl;
-      }
+      const allVals = await promise;
 
       // attach values under the property name while keeping the nav link key for traceability
       container[propName] = allVals;
@@ -268,7 +333,9 @@ async function hydrateNavigationLinks(root, odk, {
 
       // recursively hydrate within the fetched children if requested
       if (depthLeft > 1 && allVals.length) {
-        await Promise.all(allVals.map(v => limit(() => walk(v, depthLeft - 1))));
+        if (!budgetExceeded()) {
+          await Promise.all(allVals.map(v => limit(() => walk(v, depthLeft - 1))));
+        }
       }
     } catch (err) {
       logger.warn({ err, linkUrl, finalUrl, propName }, 'navigationLink fetch failed');
@@ -280,22 +347,23 @@ async function hydrateNavigationLinks(root, odk, {
     if (!node || typeof node !== 'object') return;
     if (seenObjects.has(node)) return;
     seenObjects.add(node);
+    if (budgetExceeded()) return;
 
     if (Array.isArray(node)) {
-      for (const it of node) {
-        await walk(it, depthLeft);
-      }
+      await Promise.all(node.map(it => limit(() => walk(it, depthLeft))));
       return;
     }
 
     // 1) First recurse into existing children so we fully discover navLinks anywhere in
     // the current record, without requiring a large depth just due to JSON nesting.
+    const childTasks = [];
     for (const key of Object.keys(node)) {
       const val = node[key];
       if (!val || typeof val !== 'object') continue;
       if (key.endsWith('@odata.navigationLink')) continue;
-      await walk(val, depthLeft);
+      childTasks.push(limit(() => walk(val, depthLeft)));
     }
+    if (childTasks.length) await Promise.all(childTasks);
 
     // 2) Then resolve navigation links on this object. Any fetched values can optionally
     // be recursively hydrated (fetch-hop depth) inside fetchAndAttach().
@@ -310,10 +378,32 @@ async function hydrateNavigationLinks(root, odk, {
     if (tasks.length) await Promise.all(tasks);
   }
 
-  logger.info({ maxDepth, maxRequests, concurrency }, 'starting navigationLink hydration');
+  logger.info({ maxDepth, maxRequests, concurrency, requestTimeoutMs, timeBudgetMs }, 'starting navigationLink hydration');
   await walk(root, maxDepth);
-  logger.info({ hydratedCount, requestCount, seenLinks: seenLinks.size }, 'finished navigationLink hydration');
+  logger.info({ hydratedCount, requestCount, seenLinks: seenLinks.size, elapsedMs: Date.now() - startedAt, timeBudgetMs }, 'finished navigationLink hydration');
   return root;
+}
+
+function coerceDate(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return null;
+  return d;
+}
+
+function getRemoteUpdatedAtFromListItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const sys = item.__system;
+  if (!sys || typeof sys !== 'object') return null;
+  // Prefer updatedAt when available (captures edits), else fallback to submissionDate.
+  return coerceDate(sys.updatedAt || sys.updatedAtUtc || sys.submissionDate || sys.createdAt);
+}
+
+function getStoredUpdatedAtFromMongo(doc) {
+  if (!doc || typeof doc !== 'object') return null;
+  const sys = doc.__system;
+  if (!sys || typeof sys !== 'object') return null;
+  return coerceDate(sys.updatedAt || sys.updatedAtUtc || sys.submissionDate || sys.createdAt);
 }
 
 async function processSubmission(odk, s3client, s3bucket, bucket, projectId, formId, submission, { skipMedia = false, dryRun = false, mediaConcurrency = 2 } = {}) {
@@ -494,9 +584,8 @@ async function runOnce() {
   // determine since
   let since = null;
   if (opts.since) {
-    const d = Date.parse(opts.since);
-    if (isNaN(d)) throw new Error('Invalid --since date');
-    since = new Date(d - backwindow);
+    const d = parseSinceInput(opts.since);
+    since = new Date(d.getTime() - backwindow);
   } else if (!opts.ignoreState) {
     const state = await getSyncState(formId);
     if (state && state.lastSyncAt) since = new Date(new Date(state.lastSyncAt).getTime() - backwindow);
@@ -524,7 +613,7 @@ async function runOnce() {
   }
 
   let skip = 0;
-  let maxSeen = since ? new Date(since) : new Date(0);
+  let maxSeen = null;
   let more = true;
   let processed = 0;
 
@@ -570,6 +659,7 @@ async function runOnce() {
           concurrency: 4,
           resolveLink: resolveNavLink,
           requestTimeoutMs: opts.navTimeoutMs || 60000,
+          timeBudgetMs: opts.navBudgetMs || 120000,
         });
       } catch (err) {
         logger.warn({ err, instanceId: targetId }, 'recursive navigationLink hydration failed');
@@ -623,12 +713,26 @@ async function runOnce() {
       // extract candidate id and submission date from lightweight row
       const rawId = item.__id || item._id || item.id || item.instanceId || item.uuid;
       const normalizedId = rawId ? normalizeInstanceId(rawId) : null;
-      let listedDate = null;
-      if (item.__system) {
-        listedDate = item.__system.submissionDate || item.__system.createdAt || item.__system.submissiontime || item.__system.timestamp;
-      }
-      const listedAt = listedDate ? new Date(listedDate) : null;
+      const listedAt = getRemoteUpdatedAtFromListItem(item) || null;
       if (since && listedAt && listedAt <= since) return false;
+
+      if (listedAt && (!maxSeen || listedAt > maxSeen)) maxSeen = listedAt;
+
+      // Differential mode: if we already have this instanceId in Mongo and the remote updatedAt
+      // (or submissionDate) hasn't changed, skip the expensive per-instance fetch + hydration.
+      if (opts.diff !== false && !opts.dryRun && normalizedId && listedAt) {
+        try {
+          const existing = await getSubmission(formId, normalizedId);
+          const storedAt = getStoredUpdatedAtFromMongo(existing);
+          if (storedAt && storedAt.getTime() === listedAt.getTime()) {
+            if (listedAt && (!maxSeen || listedAt > maxSeen)) maxSeen = listedAt;
+            logger.debug({ formId, instanceId: normalizedId, listedAt: listedAt.toISOString() }, 'diff skip (unchanged)');
+            return false;
+          }
+        } catch (err) {
+          logger.debug({ err, formId, instanceId: normalizedId }, 'diff check failed, continuing');
+        }
+      }
 
       // fetch full detail per-instance (with $expand) to get attachments and nested repeats
       let record = item;
@@ -664,7 +768,7 @@ async function runOnce() {
       if (!submittedAt) submittedAt = record && (record.submittedAt || record.createdAt || record._submittedAt);
       submittedAt = submittedAt ? new Date(submittedAt) : new Date();
       if (since && submittedAt <= since) return false;
-      if (submittedAt > maxSeen) maxSeen = submittedAt;
+      if (!maxSeen || submittedAt > maxSeen) maxSeen = submittedAt;
 
       // Skip test submissions but still advance maxSeen so sync_state progresses.
       if (shouldExcludeTests() && isTestSubmission(record)) {
@@ -697,8 +801,10 @@ async function runOnce() {
           await hydrateNavigationLinks(record, odk, {
             maxDepth: opts.navDepth || 4,
             maxRequests: opts.navMaxRequests || 250,
-            concurrency: 4,
+            concurrency: opts.navConcurrency || 6,
             resolveLink: resolveNavLink,
+            requestTimeoutMs: opts.navTimeoutMs || 60000,
+            timeBudgetMs: opts.navBudgetMs || 120000,
           });
         } catch (err) {
           logger.warn({ err, rawId }, 'recursive navigationLink hydration failed');
@@ -741,6 +847,8 @@ async function runOnce() {
   if (maxSeen && maxSeen.getTime() > 0) {
     await setSyncState(formId, maxSeen.toISOString());
     logger.info({ lastSyncAt: maxSeen.toISOString() }, 'updated sync_state');
+  } else {
+    logger.info({ formId }, 'no submissions seen; sync_state not updated');
   }
 }
 
