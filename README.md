@@ -122,6 +122,76 @@ npm start
 npm run migrate
 ```
 
+---
+
+## 🧭 Export ODK Central → MongoDB (submissions + médias)
+
+Ce repo contient aussi un script de sync **ODK Central (OData)** vers **MongoDB**.
+
+### 1) Variables d'environnement
+
+Dans `.env`, renseignez au minimum :
+
+```env
+MONGODB_URI=...
+MONGODB_DATABASE=...
+
+ODK_BASE_URL=https://your-odk-central.example.com/v1
+ODK_LOGIN_URL=https://your-odk-central.example.com/v1/sessions
+ODK_EMAIL=...
+ODK_PASS=...
+ODK_PROJECT=1
+
+ODK_SUBMISSIONS_URL_TEMPLATE=https://your-odk-central.example.com/v1/projects/{projectId}/forms/{formId}.svc/Submissions?{query}
+```
+
+Options utiles (voir `.env.example`) :
+- `ODK_EXCLUDE_TESTS=true` pour ignorer les submissions marquées *test/tests*
+- `--expand` et/ou hydration `@odata.navigationLink` pour récupérer les repeats/segments
+- Médias : S3/Spaces via `S3_BUCKET`+`AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY`, sinon stockage Mongo **GridFS** (`odk_media`)
+
+### 2) Lancer une migration
+
+Lister les formulaires d'un projet (pour récupérer le `xmlFormId` à passer à `--form`) :
+
+```bash
+npm run odk:listForms -- [projectId]
+```
+
+Sync une forme (une fois) :
+
+```bash
+npm run odk:migrate -- --form <xmlFormId> --once
+```
+
+Mode démon (sync continue) :
+
+```bash
+npm run odk:migrate:daemon -- --form <xmlFormId>
+```
+
+Migrer toutes les formes du projet :
+
+```bash
+npm run odk:migrate:daemon:expand
+```
+
+### 3) Vérifier dans Mongo
+
+Les submissions sont upsertées dans la collection :
+
+```
+odk_submissions_<formId>
+```
+
+Debug rapide :
+
+```bash
+node scripts/listSubmissions.js <formId>
+```
+
+---
+
 ### Workflow du script
 
 ```mermaid

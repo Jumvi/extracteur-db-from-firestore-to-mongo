@@ -27,6 +27,7 @@ program
   .option('--form <formId>', 'form id to sync')
   .option('--project <projectId>', 'ODK project id', process.env.ODK_PROJECT || '1')
   .option('--since <iso>', 'ISO date to fetch since')
+  .option('--instance <instanceId>', 'process only a specific submission instanceId (__id)')
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
   .option('--pageSize <n>', 'page size', parseInt10, 200)
@@ -39,6 +40,7 @@ program
   .option('--no-hydrate-nav', 'disable @odata.navigationLink hydration')
   .option('--nav-depth <n>', 'navigationLink hydration max depth', parseInt10, 4)
   .option('--nav-max-requests <n>', 'max navigationLink requests per submission', parseInt10, 250)
+  .option('--nav-timeout-ms <n>', 'hard timeout per navigationLink request (ms)', parseInt10, 60000)
   .option('--strip-navlinks', 'delete "@odata.navigationLink" keys after successful hydration')
   .option('--exclude-tests', 'skip submissions where type_donnee is test/tests (default: true unless --include-tests)')
   .option('--include-tests', 'do not skip test submissions')
@@ -204,13 +206,19 @@ async function hydrateNavigationLinks(root, odk, {
   maxRequests = 250,
   concurrency = 4,
   resolveLink,
+  requestTimeoutMs = 60000,
 } = {}) {
   if (!root || typeof root !== 'object') return root;
+  // maxDepth here represents how many *fetch hops* we allow when following navLinks.
+  // - maxDepth = 1: fetch navLinks found anywhere in the existing record, but do not
+  //   recursively hydrate navLinks inside the fetched results.
+  // - maxDepth > 1: recursively hydrate inside fetched results up to maxDepth.
   if (maxDepth <= 0) return root;
 
   const seenObjects = new WeakSet();
   const seenLinks = new Set();
   let requestCount = 0;
+  let hydratedCount = 0;
   const limit = pLimit(concurrency);
 
   function getNextLink(data) {
@@ -229,7 +237,15 @@ async function hydrateNavigationLinks(root, odk, {
       let pageUrl = finalUrl;
       while (pageUrl && requestCount < maxRequests) {
         requestCount += 1;
-        const res = await odk.axios.get(pageUrl);
+        logger.info({ propName, pageUrl, requestCount, requestTimeoutMs }, 'fetching navigationLink');
+        const controller = new AbortController();
+        const to = setTimeout(() => controller.abort(), Math.max(1, requestTimeoutMs || 60000));
+        let res;
+        try {
+          res = await odk.axios.get(pageUrl, { signal: controller.signal });
+        } finally {
+          clearTimeout(to);
+        }
         const vals = parseODataCollection(res && res.data);
         if (vals && vals.length) allVals.push(...vals);
 
@@ -246,6 +262,9 @@ async function hydrateNavigationLinks(root, odk, {
       if (opts.stripNavlinks) {
         try { delete container[linkKey]; } catch (e) { /* ignore */ }
       }
+
+      hydratedCount += 1;
+      logger.info({ propName, items: allVals.length, depthLeft, requestCount, maxRequests }, 'hydrated navigationLink');
 
       // recursively hydrate within the fetched children if requested
       if (depthLeft > 1 && allVals.length) {
@@ -269,7 +288,17 @@ async function hydrateNavigationLinks(root, odk, {
       return;
     }
 
-    // 1) resolve navigation links on this object
+    // 1) First recurse into existing children so we fully discover navLinks anywhere in
+    // the current record, without requiring a large depth just due to JSON nesting.
+    for (const key of Object.keys(node)) {
+      const val = node[key];
+      if (!val || typeof val !== 'object') continue;
+      if (key.endsWith('@odata.navigationLink')) continue;
+      await walk(val, depthLeft);
+    }
+
+    // 2) Then resolve navigation links on this object. Any fetched values can optionally
+    // be recursively hydrated (fetch-hop depth) inside fetchAndAttach().
     const tasks = [];
     for (const key of Object.keys(node)) {
       const m = key.match(/^(.+)@odata\.navigationLink$/);
@@ -279,19 +308,11 @@ async function hydrateNavigationLinks(root, odk, {
       tasks.push(limit(() => fetchAndAttach(node, propName, key, linkUrl, depthLeft)));
     }
     if (tasks.length) await Promise.all(tasks);
-
-    // 2) recurse into children
-    if (depthLeft <= 1) return;
-    for (const key of Object.keys(node)) {
-      const val = node[key];
-      if (!val || typeof val !== 'object') continue;
-      // do not recurse into the navLink string keys
-      if (key.endsWith('@odata.navigationLink')) continue;
-      await walk(val, depthLeft - 1);
-    }
   }
 
+  logger.info({ maxDepth, maxRequests, concurrency }, 'starting navigationLink hydration');
   await walk(root, maxDepth);
+  logger.info({ hydratedCount, requestCount, seenLinks: seenLinks.size }, 'finished navigationLink hydration');
   return root;
 }
 
@@ -506,6 +527,66 @@ async function runOnce() {
   let maxSeen = since ? new Date(since) : new Date(0);
   let more = true;
   let processed = 0;
+
+  // If an explicit instanceId is provided, sync only that submission.
+  if (opts.instance) {
+    const targetId = normalizeInstanceId(opts.instance);
+    logger.info({ formId, instanceId: targetId, navDepth: opts.navDepth, navMaxRequests: opts.navMaxRequests }, 'starting targeted instance run');
+    let record = null;
+    try {
+      if (expand) {
+        const encodedId = encodeInstanceIdOnce(targetId);
+        const perQ = `('${encodedId}')?${`$expand=${encodeURIComponent(expand)}`}`;
+        record = await odk.fetchSubmissions(projectId, formId, perQ);
+      } else {
+        const filterExpr = `__id eq '${escapeODataStringLiteral(targetId)}'`;
+        const q = `?$filter=${encodeURIComponent(filterExpr)}`;
+        record = await odk.fetchSubmissions(projectId, formId, q);
+      }
+    } catch (err) {
+      logger.error({ err, formId, instanceId: targetId }, 'failed fetching targeted submission');
+      throw err;
+    }
+
+    let doc = record;
+    if (doc && Array.isArray(doc)) doc = doc[0] || null;
+    else if (doc && doc.value && Array.isArray(doc.value)) doc = doc.value[0] || null;
+
+    if (!doc) {
+      logger.warn({ formId, instanceId: targetId }, 'targeted submission not found');
+      return;
+    }
+
+    if (shouldExcludeTests() && isTestSubmission(doc)) {
+      logger.info({ formId, instanceId: targetId }, 'skipping targeted test submission (type_donnee=test/tests)');
+      return;
+    }
+
+    if (opts.hydrateNav !== false) {
+      try {
+        await hydrateNavigationLinks(doc, odk, {
+          maxDepth: opts.navDepth || 4,
+          maxRequests: opts.navMaxRequests || 250,
+          concurrency: 4,
+          resolveLink: resolveNavLink,
+          requestTimeoutMs: opts.navTimeoutMs || 60000,
+        });
+      } catch (err) {
+        logger.warn({ err, instanceId: targetId }, 'recursive navigationLink hydration failed');
+      }
+    }
+
+    await processSubmission(odk, s3client, s3bucket, gridfsBucket, projectId, formId, doc, {
+      skipMedia: opts.skipMedia,
+      dryRun: opts.dryRun,
+      mediaConcurrency: opts.mediaConcurrency,
+    });
+
+    logger.info({ formId, instanceId: targetId }, 'finished targeted instance run');
+
+    // Intentionally do not update sync_state when running a targeted instance.
+    return;
+  }
 
   // helper to build a lightweight listing query (only ids + system metadata)
   function buildListQstr() {
