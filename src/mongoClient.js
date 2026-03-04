@@ -1,10 +1,12 @@
 const { MongoClient, GridFSBucket } = require('mongodb');
 const pino = require('pino');
+const { buildSegmentDocs } = require('./materializers/segmentsMaterializer');
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
 let client;
 let db;
+let segmentsIndexesEnsured = false;
 
 async function connect() {
   if (db) return { db, client };
@@ -16,6 +18,42 @@ async function connect() {
   db = client.db(name);
   logger.info({ msg: 'Connected to Mongo', db: name });
   return { db, client };
+}
+
+async function ensureSegmentsIndexes() {
+  await connect();
+  if (segmentsIndexesEnsured) return;
+  const col = db.collection('odk_segments');
+  await Promise.all([
+    col.createIndex({ formId: 1, submissionDate: -1 }),
+    col.createIndex({ formId: 1, agent_id: 1, submissionDate: -1 }),
+    col.createIndex({ formId: 1, axe_ref: 1, submissionDate: -1 }),
+    col.createIndex({ formId: 1, troncon: 1, submissionDate: -1 }),
+    col.createIndex({ formId: 1, instanceId: 1 }),
+  ]);
+  segmentsIndexesEnsured = true;
+  logger.info('Ensured indexes for odk_segments');
+}
+
+async function materializeSegmentsFromSubmission({ formId, projectId, submission }) {
+  await connect();
+  await ensureSegmentsIndexes();
+
+  if (!submission || typeof submission !== 'object') return { deleted: 0, inserted: 0 };
+  const instanceId = submission.instanceId ? String(submission.instanceId) : null;
+  if (!instanceId) return { deleted: 0, inserted: 0 };
+
+  const docs = buildSegmentDocs({ formId, projectId, submission });
+  const col = db.collection('odk_segments');
+
+  const delRes = await col.deleteMany({ formId, instanceId });
+  if (!docs.length) {
+    return { deleted: delRes.deletedCount || 0, inserted: 0 };
+  }
+
+  const insRes = await col.insertMany(docs, { ordered: false });
+  const inserted = insRes && insRes.insertedCount ? insRes.insertedCount : docs.length;
+  return { deleted: delRes.deletedCount || 0, inserted };
 }
 
 function getBucket() {
@@ -58,4 +96,14 @@ async function clearSyncState(formId) {
   await col.deleteOne({ formId });
 }
 
-module.exports = { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState, clearSyncState };
+module.exports = {
+  connect,
+  getBucket,
+  upsertSubmission,
+  getSubmission,
+  getSyncState,
+  setSyncState,
+  clearSyncState,
+  ensureSegmentsIndexes,
+  materializeSegmentsFromSubmission,
+};

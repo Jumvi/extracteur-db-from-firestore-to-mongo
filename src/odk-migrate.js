@@ -5,7 +5,7 @@ const util = require('util');
 let pLimit = require('p-limit');
 if (pLimit && typeof pLimit !== 'function' && pLimit.default) pLimit = pLimit.default;
 const { createOdkClient } = require('./odkClient');
-const { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState, clearSyncState } = require('./mongoClient');
+const { connect, getBucket, upsertSubmission, getSubmission, getSyncState, setSyncState, clearSyncState, materializeSegmentsFromSubmission } = require('./mongoClient');
 const pino = require('pino');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const stream = require('stream');
@@ -50,11 +50,19 @@ program
   .option('--include-tests', 'do not skip test submissions')
   .option('--media-concurrency <n>', 'max concurrent media downloads/uploads per submission', parseInt10, 2)
   .option('--skip-media', 'do not download or store media')
+  .option('--materialize-segments', 'write derived segment documents into Mongo collection odk_segments')
   .option('--dry-run', 'print resulting documents instead of upserting')
   .option('--all', 'migrate all forms in the project')
   .parse(process.argv);
 
 const opts = program.opts();
+
+function shouldMaterializeSegments() {
+  if (typeof opts.materializeSegments === 'boolean') return opts.materializeSegments;
+  const env = (process.env.ODK_MATERIALIZE_SEGMENTS || '').toString().toLowerCase().trim();
+  if (!env) return false;
+  return env === '1' || env === 'true' || env === 'yes' || env === 'y';
+}
 
 function shouldExcludeTests() {
   if (opts.includeTests) return false;
@@ -516,6 +524,16 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
     console.log(util.inspect(doc, { depth: 5 }));
   } else {
     await upsertSubmission(formId, effectiveId || null, doc);
+
+    if (shouldMaterializeSegments()) {
+      try {
+        const res = await materializeSegmentsFromSubmission({ formId, projectId, submission: doc });
+        logger.info({ formId, instanceId: effectiveId || null, deleted: res.deleted, inserted: res.inserted }, 'materialized odk_segments');
+      } catch (err) {
+        logger.warn({ err, formId, instanceId: effectiveId || null }, 'segment materialization failed');
+      }
+    }
+
     // verify persistence and that attachments are associated
     try {
       const saved = await getSubmission(formId, effectiveId || null);
