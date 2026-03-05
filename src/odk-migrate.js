@@ -27,6 +27,7 @@ program
   .option('--form <formId>', 'form id to sync')
   .option('--project <projectId>', 'ODK project id', process.env.ODK_PROJECT || '1')
   .option('--since <iso>', 'ISO date to fetch since')
+  .option('--until <iso>', 'ISO date upper bound (exclusive) for Mongo backfill filtering')
   .option('--no-server-filter-since', 'do not send $filter __system/submissionDate gt ...; filter client-side only')
   .option('--instance <instanceId>', 'process only a specific submission instanceId (__id)')
   .option('--once', 'run once and exit')
@@ -266,8 +267,18 @@ async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink
     sinceIso = d.toISOString();
   }
 
+  let untilIso = null;
+  if (opts.until) {
+    const d = parseSinceInput(opts.until);
+    untilIso = d.toISOString();
+  }
+
   const filter = {};
-  if (sinceIso) filter['__system.submissionDate'] = { $gte: sinceIso };
+  if (sinceIso || untilIso) {
+    filter['__system.submissionDate'] = {};
+    if (sinceIso) filter['__system.submissionDate'].$gte = sinceIso;
+    if (untilIso) filter['__system.submissionDate'].$lt = untilIso;
+  }
 
   const projection = {
     _id: 0,
@@ -284,7 +295,7 @@ async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink
   let skipped = 0;
   let failed = 0;
 
-  logger.info({ formId, sinceIso, navConcurrency, timeoutMs, hardLimit }, 'starting backfill-segments (Mongo -> ODK -> Mongo)');
+  logger.info({ formId, sinceIso, untilIso, navConcurrency, timeoutMs, hardLimit }, 'starting backfill-segments (Mongo -> ODK -> Mongo)');
 
   const limit = pLimit(navConcurrency);
   const pending = [];
@@ -361,8 +372,8 @@ async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink
 
   if (pending.length) await Promise.allSettled(pending);
 
-  logger.info({ formId, scanned, hydrated, skipped, failed, sinceIso }, 'finished backfill-segments');
-  return { scanned, hydrated, skipped, failed, sinceIso };
+  logger.info({ formId, scanned, hydrated, skipped, failed, sinceIso, untilIso }, 'finished backfill-segments');
+  return { scanned, hydrated, skipped, failed, sinceIso, untilIso };
 }
 
 async function hydrateNavigationLinks(root, odk, {
