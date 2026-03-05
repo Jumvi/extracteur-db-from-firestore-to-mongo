@@ -164,6 +164,75 @@ Sync une forme (une fois) :
 npm run odk:migrate -- --form <xmlFormId> --once
 ```
 
+### 2.b) Récupérer par date (fenêtre temporelle)
+
+Le script supporte un **borne basse** via `--since` (ISO ou `YYYY-MM-DD`).
+
+Exemple : importer toutes les submissions à partir du 1er février (en ignorant `sync_state`) :
+
+```bash
+node src/odk-migrate.js \
+   --form <xmlFormId> \
+   --project 1 \
+   --since 2026-02-01T00:00:00.000Z \
+   --ignore-state \
+   --orderby "__system/submissionDate asc" \
+   --once
+```
+
+Notes importantes :
+- `--since` envoie (par défaut) un filtre OData côté serveur : `__system/submissionDate gt <since>`.
+- Pour éviter de rater des soumissions proches de la borne, le script applique un **backwindow** (défaut `10s`).
+   - Ajustable via `--backwindow <secs>`.
+- Si votre serveur ODK rejette le filtre, utilisez `--no-server-filter-since` (filtrage côté client uniquement).
+
+Pour une fenêtre exacte **[since, until)** lors d’un backfill Mongo (voir plus bas), utilisez `--until <iso>`.
+
+### 2.c) Hydratation des repeats / segments
+
+Deux approches complémentaires :
+
+1) `$expand` (rapide, mais il faut connaître les groupes à expanser)
+
+```bash
+node src/odk-migrate.js \
+   --form <xmlFormId> \
+   --project 1 \
+   --since 2026-02-01 \
+   --ignore-state \
+   --expand "etat_troncon,propretes_obs,point_vue_usagers" \
+   --once
+```
+
+2) Hydratation des `@odata.navigationLink` (récursif)
+
+Par défaut, le script peut suivre les `...@odata.navigationLink` et attacher les collections au document.
+
+Options utiles :
+- `--nav-depth <n>` : profondeur max (défaut `4`)
+- `--nav-concurrency <n>` : requêtes parallèles (défaut `6`)
+- `--nav-max-requests <n>` : garde-fou anti-boucle
+- `--nav-timeout-ms <n>` / `--nav-budget-ms <n>` : timeouts
+- `--strip-navlinks` : supprime les clés `@odata.navigationLink` après hydratation
+- `--no-hydrate-nav` : désactive complètement
+
+### 2.d) Backfill « segments seulement » (Mongo → ODK → Mongo)
+
+Si les submissions sont déjà en Mongo mais que vous voulez hydrater **uniquement** `etat_troncon.segments` :
+
+```bash
+node src/odk-migrate.js \
+   --form <xmlFormId> \
+   --project 1 \
+   --since 2026-02-01T00:00:00.000Z \
+   --until 2026-03-01T00:00:00.000Z \
+   --backfill-segments \
+   --once
+```
+
+Par défaut, le backfill **skip** les docs où `etat_troncon.segments` est déjà présent.
+Pour forcer un recalcul : `--segments-force`.
+
 Mode démon (sync continue) :
 
 ```bash
@@ -189,6 +258,84 @@ Debug rapide :
 ```bash
 node scripts/listSubmissions.js <formId>
 ```
+
+---
+
+## 🖼️ Médias ODK → DigitalOcean Spaces (S3) + CDN
+
+Le script [src/odk-migrate.js](src/odk-migrate.js) peut :
+- Télécharger les médias depuis ODK (attachments)
+- Les stocker soit dans **DigitalOcean Spaces (S3 compatible)**, soit dans **Mongo GridFS** (fallback)
+- Écrire dans Mongo un tableau `attachments[]` contenant les URLs/metadata
+
+### Comportement
+
+- Si `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` + `S3_BUCKET` sont définis : upload dans Spaces.
+   - La clé objet utilisée est :
+      - `"<formId>/<instanceId>/<filename>"`
+   - Le script écrit l’URL publique dans `attachments[].s3`.
+- Sinon : stockage dans GridFS (bucket `odk_media`) et `attachments[].gridFs`.
+
+Pour désactiver le transfert binaire (ne garder que des liens proxy), utilisez `--skip-media`.
+
+### Compression d'images (optionnel)
+
+Pour faciliter l'usage dans le front (images plus légères), vous pouvez activer une compression avant upload S3.
+
+```env
+ODK_MEDIA_COMPRESS_IMAGES=true
+ODK_MEDIA_MAX_WIDTH=1920
+ODK_MEDIA_JPEG_QUALITY=80
+ODK_MEDIA_PNG_COMPRESSION_LEVEL=9
+```
+
+Effets :
+- Applique seulement aux fichiers `.jpg/.jpeg/.png`.
+- Uploade l'image compressée à la **même clé S3** (`<formId>/<instanceId>/<filename>`).
+- Enrichit `attachments[]` avec des champs utiles au front :
+   - `s3Compressed=true`, `s3ContentType`, `s3Bytes`
+
+### Variables Spaces / S3
+
+```env
+AWS_ACCESS_KEY_ID=...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
+
+S3_BUCKET=du-medias
+S3_ENDPOINT=https://sfo3.digitaloceanspaces.com
+S3_FORCE_PATH_STYLE=false
+
+# (optionnel) ACL appliquée à l’upload (défaut: public-read)
+S3_PUBLIC_ACL=public-read
+```
+
+### CDN public (optionnel)
+
+Ces variables contrôlent **comment l’URL publique** est construite après upload :
+
+```env
+S3_CDN=https://du-medias.sfo3.cdn.digitaloceanspaces.com
+S3_USE_CDN=true
+S3_PUBLIC_URL_TEMPLATE={cdn}/{key}
+```
+
+Interprétation :
+- `S3_USE_CDN=true` : le code préfère construire l’URL via le CDN
+- `S3_CDN` : base URL du CDN
+- `S3_PUBLIC_URL_TEMPLATE` : modèle d’URL publique
+   - Tokens : `{cdn}`, `{bucket}`, `{key}`
+   - `{key}` correspond à la clé objet S3 (ex: `audit_form/uuid:.../photo.jpg`) et est **encodée** segment par segment
+
+Exemple d’URL produite :
+
+```text
+https://du-medias.sfo3.cdn.digitaloceanspaces.com/<formId>/<instanceId>/<filename>
+```
+
+Si votre Space/CDN est privé, laissez `S3_PUBLIC_ACL` à une valeur restrictive et utilisez plutôt :
+- un proxy backend (`ODK_ATTACHMENT_PROXY_TEMPLATE`) ou
+- des URLs signées côté application.
 
 ---
 

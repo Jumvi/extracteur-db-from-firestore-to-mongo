@@ -13,9 +13,91 @@ const { promisify } = require('util');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+let sharp = null;
 
 const pipeline = promisify(stream.pipeline);
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
+function parseBoolEnv(name, defaultValue = false) {
+  const raw = process.env[name];
+  if (raw === null || typeof raw === 'undefined') return defaultValue;
+  const s = String(raw).trim().toLowerCase();
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'y') return true;
+  if (s === '0' || s === 'false' || s === 'no' || s === 'n') return false;
+  return defaultValue;
+}
+
+function parseIntEnv(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw === null || typeof raw === 'undefined' || String(raw).trim() === '') return defaultValue;
+  const n = Number.parseInt(String(raw), 10);
+  return Number.isFinite(n) ? n : defaultValue;
+}
+
+function shouldCompressOdkImagesForS3() {
+  // Off by default to preserve current behavior unless explicitly enabled.
+  return parseBoolEnv('ODK_MEDIA_COMPRESS_IMAGES', false);
+}
+
+function isJpegFilename(name) {
+  return /\.(jpe?g)$/i.test(String(name || ''));
+}
+
+function isPngFilename(name) {
+  return /\.(png)$/i.test(String(name || ''));
+}
+
+function isCompressibleImage(filename, contentType) {
+  if (isJpegFilename(filename) || isPngFilename(filename)) return true;
+  const ct = String(contentType || '').toLowerCase();
+  return ct === 'image/jpeg' || ct === 'image/jpg' || ct === 'image/png';
+}
+
+async function streamToTempFile(readable, tmpNamePrefix) {
+  const tmpName = `${tmpNamePrefix}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const tmpPath = path.join(os.tmpdir(), tmpName);
+  await pipeline(readable, fs.createWriteStream(tmpPath));
+  const st = await fs.promises.stat(tmpPath);
+  return { tmpPath, size: st.size };
+}
+
+async function compressImageFileToTemp({ inputPath, filename, contentType }) {
+  // Lazy-load sharp so installs without sharp still run when compression is off.
+  if (!sharp) {
+    try {
+      // eslint-disable-next-line global-require
+      sharp = require('sharp');
+    } catch (e) {
+      throw new Error('sharp is not installed; run `npm install sharp` or disable ODK_MEDIA_COMPRESS_IMAGES');
+    }
+  }
+
+  const maxWidth = parseIntEnv('ODK_MEDIA_MAX_WIDTH', 1920);
+  const jpegQuality = parseIntEnv('ODK_MEDIA_JPEG_QUALITY', 80);
+  const pngCompressionLevel = parseIntEnv('ODK_MEDIA_PNG_COMPRESSION_LEVEL', 9);
+
+  const outPrefix = 'odk_img_compressed';
+  const outName = `${outPrefix}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  const outPath = path.join(os.tmpdir(), outName);
+
+  let transformer = sharp(inputPath).rotate();
+  if (maxWidth && Number.isFinite(maxWidth) && maxWidth > 0) {
+    transformer = transformer.resize({ width: maxWidth, withoutEnlargement: true });
+  }
+
+  let outContentType = contentType;
+  if (isJpegFilename(filename) || String(contentType || '').toLowerCase() === 'image/jpeg') {
+    transformer = transformer.jpeg({ quality: jpegQuality, mozjpeg: true });
+    outContentType = 'image/jpeg';
+  } else if (isPngFilename(filename) || String(contentType || '').toLowerCase() === 'image/png') {
+    transformer = transformer.png({ compressionLevel: Math.min(9, Math.max(0, pngCompressionLevel)) });
+    outContentType = 'image/png';
+  }
+
+  await transformer.toFile(outPath);
+  const st = await fs.promises.stat(outPath);
+  return { tmpPath: outPath, size: st.size, contentType: outContentType };
+}
 
 function parseInt10(v) {
   const n = Number.parseInt(String(v), 10);
@@ -622,15 +704,63 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
         const mediaRes = await odk.downloadMedia(projectId, formId, effectiveId, filename);
         if (s3client && s3bucket) {
           const key = `${formId}/${effectiveId}/${filename}`;
-          const url = await uploadToS3(
-            s3client,
-            s3bucket,
-            key,
-            mediaRes,
-            (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream'
-          );
-          att.s3 = url;
-          doc[`${fieldPath}_url`] = url;
+          const inputContentType = (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream';
+
+          // Optional: compress images before upload to make frontend usage faster.
+          // Enabled via env ODK_MEDIA_COMPRESS_IMAGES=true.
+          if (shouldCompressOdkImagesForS3() && isCompressibleImage(filename, inputContentType)) {
+            let originalTmp = null;
+            let compressedTmp = null;
+            try {
+              const inputStream = mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes;
+              originalTmp = await streamToTempFile(inputStream, 'odk_img_original');
+              compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
+              const url = await uploadToS3(
+                s3client,
+                s3bucket,
+                key,
+                {
+                  stream: fs.createReadStream(compressedTmp.tmpPath),
+                  headers: {
+                    'content-length': String(compressedTmp.size),
+                    'content-type': compressedTmp.contentType,
+                  },
+                },
+                compressedTmp.contentType
+              );
+              att.s3 = url;
+              att.s3Compressed = true;
+              att.s3ContentType = compressedTmp.contentType;
+              att.s3Bytes = compressedTmp.size;
+              doc[`${fieldPath}_url`] = url;
+            } catch (err) {
+              logger.warn({ err, formId, instanceId: effectiveId, filename }, 'image compression failed; uploading original');
+              // Best-effort fallback: re-download and upload original.
+              const mediaRes2 = await odk.downloadMedia(projectId, formId, effectiveId, filename);
+              const url = await uploadToS3(
+                s3client,
+                s3bucket,
+                key,
+                mediaRes2,
+                (mediaRes2 && mediaRes2.headers && (mediaRes2.headers['content-type'] || mediaRes2.headers['Content-Type'])) || inputContentType
+              );
+              att.s3 = url;
+              doc[`${fieldPath}_url`] = url;
+            } finally {
+              try { if (originalTmp && originalTmp.tmpPath) await fs.promises.unlink(originalTmp.tmpPath); } catch (_) { /* ignore */ }
+              try { if (compressedTmp && compressedTmp.tmpPath) await fs.promises.unlink(compressedTmp.tmpPath); } catch (_) { /* ignore */ }
+            }
+          } else {
+            const url = await uploadToS3(
+              s3client,
+              s3bucket,
+              key,
+              mediaRes,
+              inputContentType
+            );
+            att.s3 = url;
+            doc[`${fieldPath}_url`] = url;
+          }
         } else {
           const res = await uploadToGridFS(bucket, `${formId}_${effectiveId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
           att.gridFs = res;
