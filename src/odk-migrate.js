@@ -31,6 +31,8 @@ program
   .option('--instance <instanceId>', 'process only a specific submission instanceId (__id)')
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
+  .option('--backfill-segments', 'for submissions already in Mongo, hydrate only etat_troncon/segments via OData and update docs in-place')
+  .option('--segments-force', 'overwrite existing etat_troncon.segments (default: skip if already present)')
   .option('--pageSize <n>', 'page size', parseInt10, 200)
   .option('--limit <n>', 'max number of submissions to process per run', parseInt10)
   .option('--orderby <expr>', 'OData $orderby expression (e.g. "__system/submissionDate asc")', '')
@@ -239,6 +241,128 @@ function parseODataCollection(data) {
   // single object
   if (typeof data === 'object') return [data];
   return [];
+}
+
+function pickSegmentsNavLinkFromDoc(doc) {
+  if (!doc || typeof doc !== 'object') return null;
+  // The navigationLink is often stored under the parent object (etat_troncon), but may also appear at the root.
+  if (doc.etat_troncon && typeof doc.etat_troncon === 'object') {
+    const nested = doc.etat_troncon['segments@odata.navigationLink'];
+    if (nested) return String(nested);
+  }
+  const root = doc['segments@odata.navigationLink'];
+  if (root) return String(root);
+  return null;
+}
+
+async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink }) {
+  const col = db.collection(`odk_submissions_${formId}`);
+  const navConcurrency = opts.navConcurrency || 6;
+  const timeoutMs = opts.navTimeoutMs || 60000;
+
+  let sinceIso = null;
+  if (opts.since) {
+    const d = parseSinceInput(opts.since);
+    sinceIso = d.toISOString();
+  }
+
+  const filter = {};
+  if (sinceIso) filter['__system.submissionDate'] = { $gte: sinceIso };
+
+  const projection = {
+    _id: 0,
+    instanceId: 1,
+    '__system.submissionDate': 1,
+    etat_troncon: 1,
+    'segments@odata.navigationLink': 1,
+  };
+
+  const hardLimit = typeof opts.limit === 'number' && !isNaN(opts.limit) && opts.limit > 0 ? opts.limit : null;
+
+  let scanned = 0;
+  let hydrated = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  logger.info({ formId, sinceIso, navConcurrency, timeoutMs, hardLimit }, 'starting backfill-segments (Mongo -> ODK -> Mongo)');
+
+  const limit = pLimit(navConcurrency);
+  const pending = [];
+
+  const cursor = col.find(filter).project(projection);
+  for await (const doc of cursor) {
+    if (hardLimit && scanned >= hardLimit) break;
+    scanned += 1;
+
+    pending.push(limit(async () => {
+      const instanceId = doc && doc.instanceId ? String(doc.instanceId) : null;
+      if (!instanceId) {
+        skipped += 1;
+        return;
+      }
+
+      const existingSegments = doc.etat_troncon && typeof doc.etat_troncon === 'object' ? doc.etat_troncon.segments : null;
+      if (!opts.segmentsForce && Array.isArray(existingSegments) && existingSegments.length) {
+        skipped += 1;
+        return;
+      }
+
+      const storedNavLink = pickSegmentsNavLinkFromDoc(doc);
+      const fallbackNavLink = `Submissions('${encodeInstanceIdOnce(instanceId)}')/etat_troncon/segments`;
+      const rel = storedNavLink || fallbackNavLink;
+      const url = resolveNavLink(rel);
+
+      let segments = [];
+      try {
+        const res = await odk.axios.get(url, { timeout: timeoutMs });
+        segments = parseODataCollection(res.data);
+      } catch (err) {
+        failed += 1;
+        logger.warn({ err, formId, instanceId, url, rel }, 'segments hydration failed');
+        return;
+      }
+
+      const hydratedAt = new Date().toISOString();
+      try {
+        await col.updateOne(
+          { instanceId },
+          {
+            $set: {
+              'etat_troncon.segments': segments,
+              'etat_troncon.segments__hydratedAt': hydratedAt,
+              'etat_troncon.segments__odataNavigationLink': rel,
+            },
+          }
+        );
+        hydrated += 1;
+      } catch (err) {
+        failed += 1;
+        logger.warn({ err, formId, instanceId }, 'failed updating Mongo with hydrated segments');
+        return;
+      }
+
+      if (shouldMaterializeSegments()) {
+        try {
+          const saved = await getSubmission(formId, instanceId);
+          if (saved) {
+            const res2 = await materializeSegmentsFromSubmission({ formId, projectId, submission: saved });
+            logger.info({ formId, instanceId, deleted: res2.deleted, inserted: res2.inserted }, 'materialized odk_segments (backfill)');
+          }
+        } catch (err) {
+          logger.warn({ err, formId, instanceId }, 'segment materialization failed (backfill)');
+        }
+      }
+    }));
+
+    if (pending.length >= navConcurrency * 4) {
+      await Promise.allSettled(pending.splice(0, pending.length));
+    }
+  }
+
+  if (pending.length) await Promise.allSettled(pending);
+
+  logger.info({ formId, scanned, hydrated, skipped, failed, sinceIso }, 'finished backfill-segments');
+  return { scanned, hydrated, skipped, failed, sinceIso };
 }
 
 async function hydrateNavigationLinks(root, odk, {
@@ -572,7 +696,7 @@ async function runOnce() {
   await odk.login();
 
   // mongo connection and bucket
-  await connect();
+  const { db } = await connect();
   const gridfsBucket = getBucket();
 
   if (opts.resetState) {
@@ -628,6 +752,11 @@ async function runOnce() {
     if (u.startsWith('/')) return u;
     if (svcRoot) return `${svcRoot}${u}`;
     return u;
+  }
+
+  if (opts.backfillSegments) {
+    await backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink });
+    return;
   }
 
   let skip = 0;

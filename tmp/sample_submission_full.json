@@ -1,0 +1,880 @@
+{
+  "_id": "69a8420d1a15f4fe2e615453",
+  "agent_id": "equipe_2",
+  "group_notes_01": {
+    "note_01": null,
+    "note_02": null,
+    "note_03": null,
+    "note_04": null,
+    "note_05": null
+  },
+  "group_02": {
+    "type_donnee": "reelles",
+    "type_donnee_save": "reelles",
+    "type_donnee_confirmation": "oui"
+  },
+  "admin_conformite": {
+    "info_generales_01": {
+      "troncon": "6",
+      "troncon_nom_ref": "BOUCLE SUNDI-MADUDA : AVENUE KASAVUBU-AVENUE KISANGANI (BOUCLE SUNDI-MADUDA)",
+      "axe_ref": "BOUCLE SUNDI-MADUDA",
+      "entreprise_ref": "MODERN CONSTRUCTION",
+      "mission_ref": "AKILI BAOBA",
+      "info_troncon_titre": null,
+      "info_troncon_nom": null,
+      "info_troncon_axe": null,
+      "info_troncon_entreprise": null,
+      "info_troncon_mission": null,
+      "troncon_entreprise": "MODERN CONSTRUCTION",
+      "troncon_mission": "AKILI BAOBA"
+    },
+    "info_generales_02": {
+      "disponibilite_responsable": "oui",
+      "personne_ressource": "Zacharie Makabu Tshimanga",
+      "qualite_personne_ressource": "Chef de mission",
+      "pk_debut_troncon": 0.0001,
+      "pk_debut_troncon_save": "1.0E-4",
+      "pk_debut_photo": "1772016732328.jpg",
+      "date_signature_contrat": null,
+      "mod": "Ministère provincial des ITPR",
+      "date_lancement_travaux": "2024-10-29",
+      "duree_prevue_mois": 12,
+      "periode_collecte": null,
+      "date_debut": "2026-02-24",
+      "date_fin": "2026-02-26",
+      "meteo": "ensoleille",
+      "panneau_chantier_entree": "non",
+      "panneau_photo_entree": null
+    },
+    "verification_conformite": {
+      "journal_chantier": "oui",
+      "plans_exec": "non",
+      "planning_affiche": "non",
+      "proprete_site": "non"
+    }
+  },
+  "etat_troncon": {
+    "nb_segments": 3,
+    "nb_segments_lock": "3",
+    "segments@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/etat_troncon/segments",
+    "segments": [
+      {
+        "segment_no": "1",
+        "segment_header": null,
+        "pkf_prev": "1.0E-4",
+        "statut_troncon_01": {
+          "type_segment": "route",
+          "statut_segment": "fini",
+          "pk0_segment": 0.0001,
+          "pk0_segment_photo": "1772016966727.jpg",
+          "gps_pk0_segment": {
+            "type": "Point",
+            "coordinates": [
+              15.2791998,
+              -4.3421689,
+              272.5
+            ],
+            "properties": {
+              "accuracy": 4.966
+            }
+          }
+        },
+        "type_revetement_fini": null,
+        "segment_route": {
+          "largeur_chaussee_debut": null,
+          "nb_bandes": null,
+          "niveau": null,
+          "opt1": {
+            "equipement_terrassement": null,
+            "materiaux_terrassement": null
+          },
+          "group_opt1": {
+            "compactage_verif": null,
+            "compactage_photo": null,
+            "nivellement_verif": null,
+            "nivellement_photo": null,
+            "epaisseur_verif": null,
+            "epaisseur_photo": null
+          },
+          "opt2": {
+            "equipement_corps_chaussee": null,
+            "materiaux_corps_chaussee": null,
+            "qualite_materiaux_verif": null
+          },
+          "group_opt2": {
+            "qualite_materiaux_photo": null,
+            "impregnation_photo": null
+          },
+          "opt3": {
+            "equipement_revetement": null,
+            "materiaux_revetement": null,
+            "type_revetement": null
+          },
+          "impregnation_verif": null,
+          "technologie_curage": null,
+          "group_opt3": {
+            "curage_photo": null,
+            "qualite_joints": null,
+            "joints_photo": null,
+            "qualite_beton": null,
+            "qualite_beton_photo": null,
+            "aspect_visuel_asphalte": null,
+            "aspect_visuel_beton": null,
+            "aspect_photo": null
+          },
+          "assainissement": {
+            "assain_prevus": null
+          },
+          "assain_obs_global": null,
+          "signalisation_securite": {
+            "barriere_protection": null,
+            "barriere_photo": null,
+            "epi": null,
+            "epi_photo": null,
+            "trafic_segment": null,
+            "type_trafic": null,
+            "signaleurs_extremites": null,
+            "gestion_trafic_alternative": null,
+            "marquage_signalisation": null
+          },
+          "signalisation_securite_01": {},
+          "environnement": {
+            "dechets": {
+              "evacuation_deblais": null,
+              "deblais_photo": null,
+              "restes_enrobes_dechets": null,
+              "dechets_photo": null
+            },
+            "nuisances": {
+              "arrosage_anti_poussiere": null,
+              "vibrations_compactage": null,
+              "nuisance_sonore": null
+            },
+            "nuisances_01": {}
+          }
+        },
+        "type_ouvrage_non_debute": null,
+        "ouvrage_franchissement": {
+          "identification_ouvrage": {
+            "type_ouvrage": null,
+            "largeur_ouvrage": null,
+            "longueur_ouvrage": null,
+            "obstacles_ouvrages_franchis": null,
+            "denomination_ouvrage": null
+          },
+          "evaluation_ouvrage": {
+            "situation_pont": null,
+            "niveau_infrastructure": {
+              "niveau_infrastructure_fouille": null,
+              "niveau_infrastructure_radie_amont": null,
+              "niveau_infrastructure_radie_aval": null,
+              "nombre_piles": null,
+              "nombre_piles_coffrage": null,
+              "nombre_piles_armature": null,
+              "nombre_piles_betonnage": null,
+              "nombre_piles_decroffrage": null,
+              "niveau_infrastructure_culee_amont": null,
+              "niveau_infrastructure_culee_aval": null,
+              "existance_appareil_appui": null,
+              "alignement_appareil_appui": null,
+              "fixation_appareil_appui": null,
+              "controle_appareil_appui": null
+            },
+            "niveau_superstructure": {
+              "niveau_superfrastructure_poutre_longitudinale": null,
+              "beton_superstructure": null,
+              "dalle_superstructure": null,
+              "dalle_acces_superstructure": null,
+              "garde_corps_superstructure": null,
+              "note_superstructure_assainissement": null,
+              "vegetalisation_superstructure": null,
+              "signalisation_superstructure": null,
+              "note_superstructure_finition": null,
+              "peinture_superstructure": null,
+              "marquage_superstructure": null
+            },
+            "groupe_comment_pont_construction": {},
+            "situation_buse": null,
+            "evaluation_buse_existant": {
+              "etat_visuel_buse": null,
+              "affouillement_amont": null,
+              "affouillement_aval": null
+            },
+            "evaluation_buse_construction": {
+              "buse_construction": null
+            },
+            "groupe_comment_buse_construction": {},
+            "situation_dalot": null,
+            "evaluation_dalo_existant": {
+              "etat_ecoulement_dalot": null
+            },
+            "evaluation_dalot_construction": {
+              "niveau_execution_dalot": null,
+              "etat_niveau_execution_dalot_fouille": null,
+              "etat_niveau_execution_dalot": null
+            },
+            "groupe_comment_dalot_construction": {},
+            "situation_caniveau_trans": null,
+            "evaluation_caniveau_existant": {
+              "inspection_visuelle": {
+                "epaisseur_dalle": null,
+                "degradation_caniveau": null,
+                "fissure_caniveau": null,
+                "corrosion_caniveau": null,
+                "nivellement_caniveau": null
+              },
+              "etat_ecoulement_caniveau": null
+            },
+            "evaluation_caniveau_construction": {
+              "niveau_caniveau_trans_fouille": null,
+              "niveau_caniveau_trans_fondation": null,
+              "murs_lateraux_caniveau_trans": null,
+              "niveau_murs_lateraux_caniveau_trans_beton": null,
+              "niveau_murs_lateraux_caniveau_trans_chainage": null,
+              "dalle_couverture": {
+                "type_dalle_caniveau_trans": null,
+                "niveau_execution_coulee_caniveau_trans": null,
+                "niveau_execution_prefabrique_caniveau_trans": null
+              }
+            },
+            "caniveau_photo_amont": null,
+            "caniveau_photo_aval": null,
+            "caniveau_photo_dessous": null
+          },
+          "structure": {
+            "structure_note": null
+          },
+          "equipements": {
+            "barbacanes_bouchees": null,
+            "barbacanes_obs": null,
+            "vegetation_tablier": null,
+            "vegetation_tablier_obs": null,
+            "joints_rompus": null,
+            "joints_obs": null,
+            "garde_corps": null,
+            "signalisation": null,
+            "nids_poule_abords": null,
+            "abords_obs": null
+          },
+          "hydro_env": {
+            "embacles": null,
+            "embacles_obs": null,
+            "erosion_berges": null,
+            "erosion_obs": null,
+            "vegetation_maconnerie": null,
+            "vegetation_maconnerie_obs": null
+          },
+          "etat_global": {
+            "note_service_globale": null
+          },
+          "recommandations": {
+            "strategie": null,
+            "comment_entretien_courant": null,
+            "comment_entretien_specialise": null,
+            "comment_reparation_struct": null,
+            "comment_rehab_renfort": null,
+            "comment_remplacement": null
+          },
+          "photos_ouvrage": {
+            "photo_ouvrage_1": null,
+            "photo_ouvrage_2": null,
+            "photo_ouvrage_3": null
+          }
+        },
+        "passage_niveau": {
+          "pk_passage_niveau": null,
+          "presence_signalisation": null,
+          "photo_signalisation_passage_niveau": null,
+          "barriere_passage": null,
+          "photo_barriere_securite": null,
+          "photo_passage_niveau": null
+        },
+        "pkf_segment_01": {
+          "pkf_segment": 0.3081,
+          "largeur_chaussee_fin": 7.001,
+          "pk_fin_segment_photo": "1772017467311.jpg",
+          "gps_pkf_segment": {
+            "type": "Point",
+            "coordinates": [
+              15.2774632,
+              -4.3408818,
+              300.1
+            ],
+            "properties": {
+              "accuracy": 4.883
+            }
+          }
+        },
+        "__id": "62b2443310b41a1b20b11cd9cf411e42e077ca0d",
+        "__Submissions-id": "uuid:27c7a295-7038-466a-95b6-36cef6992f10"
+      },
+      {
+        "segment_no": "2",
+        "segment_header": null,
+        "pkf_prev": "0.3081",
+        "statut_troncon_01": {
+          "type_segment": "route",
+          "statut_segment": "non_debute",
+          "pk0_segment": 0.3081,
+          "pk0_segment_photo": "1772017518415.jpg",
+          "gps_pk0_segment": {
+            "type": "Point",
+            "coordinates": [
+              15.2774548,
+              -4.3408949,
+              300.1
+            ],
+            "properties": {
+              "accuracy": 4.025
+            }
+          }
+        },
+        "type_revetement_fini": null,
+        "segment_route": {
+          "largeur_chaussee_debut": null,
+          "nb_bandes": null,
+          "niveau": null,
+          "opt1": {
+            "equipement_terrassement": null,
+            "materiaux_terrassement": null
+          },
+          "group_opt1": {
+            "compactage_verif": null,
+            "compactage_photo": null,
+            "nivellement_verif": null,
+            "nivellement_photo": null,
+            "epaisseur_verif": null,
+            "epaisseur_photo": null
+          },
+          "opt2": {
+            "equipement_corps_chaussee": null,
+            "materiaux_corps_chaussee": null,
+            "qualite_materiaux_verif": null
+          },
+          "group_opt2": {
+            "qualite_materiaux_photo": null,
+            "impregnation_photo": null
+          },
+          "opt3": {
+            "equipement_revetement": null,
+            "materiaux_revetement": null,
+            "type_revetement": null
+          },
+          "impregnation_verif": null,
+          "technologie_curage": null,
+          "group_opt3": {
+            "curage_photo": null,
+            "qualite_joints": null,
+            "joints_photo": null,
+            "qualite_beton": null,
+            "qualite_beton_photo": null,
+            "aspect_visuel_asphalte": null,
+            "aspect_visuel_beton": null,
+            "aspect_photo": null
+          },
+          "assainissement": {
+            "assain_prevus": null
+          },
+          "assain_obs_global": null,
+          "signalisation_securite": {
+            "barriere_protection": null,
+            "barriere_photo": null,
+            "epi": null,
+            "epi_photo": null,
+            "trafic_segment": null,
+            "type_trafic": null,
+            "signaleurs_extremites": null,
+            "gestion_trafic_alternative": null,
+            "marquage_signalisation": null
+          },
+          "signalisation_securite_01": {},
+          "environnement": {
+            "dechets": {
+              "evacuation_deblais": null,
+              "deblais_photo": null,
+              "restes_enrobes_dechets": null,
+              "dechets_photo": null
+            },
+            "nuisances": {
+              "arrosage_anti_poussiere": null,
+              "vibrations_compactage": null,
+              "nuisance_sonore": null
+            },
+            "nuisances_01": {}
+          }
+        },
+        "type_ouvrage_non_debute": null,
+        "ouvrage_franchissement": {
+          "identification_ouvrage": {
+            "type_ouvrage": null,
+            "largeur_ouvrage": null,
+            "longueur_ouvrage": null,
+            "obstacles_ouvrages_franchis": null,
+            "denomination_ouvrage": null
+          },
+          "evaluation_ouvrage": {
+            "situation_pont": null,
+            "niveau_infrastructure": {
+              "niveau_infrastructure_fouille": null,
+              "niveau_infrastructure_radie_amont": null,
+              "niveau_infrastructure_radie_aval": null,
+              "nombre_piles": null,
+              "nombre_piles_coffrage": null,
+              "nombre_piles_armature": null,
+              "nombre_piles_betonnage": null,
+              "nombre_piles_decroffrage": null,
+              "niveau_infrastructure_culee_amont": null,
+              "niveau_infrastructure_culee_aval": null,
+              "existance_appareil_appui": null,
+              "alignement_appareil_appui": null,
+              "fixation_appareil_appui": null,
+              "controle_appareil_appui": null
+            },
+            "niveau_superstructure": {
+              "niveau_superfrastructure_poutre_longitudinale": null,
+              "beton_superstructure": null,
+              "dalle_superstructure": null,
+              "dalle_acces_superstructure": null,
+              "garde_corps_superstructure": null,
+              "note_superstructure_assainissement": null,
+              "vegetalisation_superstructure": null,
+              "signalisation_superstructure": null,
+              "note_superstructure_finition": null,
+              "peinture_superstructure": null,
+              "marquage_superstructure": null
+            },
+            "groupe_comment_pont_construction": {},
+            "situation_buse": null,
+            "evaluation_buse_existant": {
+              "etat_visuel_buse": null,
+              "affouillement_amont": null,
+              "affouillement_aval": null
+            },
+            "evaluation_buse_construction": {
+              "buse_construction": null
+            },
+            "groupe_comment_buse_construction": {},
+            "situation_dalot": null,
+            "evaluation_dalo_existant": {
+              "etat_ecoulement_dalot": null
+            },
+            "evaluation_dalot_construction": {
+              "niveau_execution_dalot": null,
+              "etat_niveau_execution_dalot_fouille": null,
+              "etat_niveau_execution_dalot": null
+            },
+            "groupe_comment_dalot_construction": {},
+            "situation_caniveau_trans": null,
+            "evaluation_caniveau_existant": {
+              "inspection_visuelle": {
+                "epaisseur_dalle": null,
+                "degradation_caniveau": null,
+                "fissure_caniveau": null,
+                "corrosion_caniveau": null,
+                "nivellement_caniveau": null
+              },
+              "etat_ecoulement_caniveau": null
+            },
+            "evaluation_caniveau_construction": {
+              "niveau_caniveau_trans_fouille": null,
+              "niveau_caniveau_trans_fondation": null,
+              "murs_lateraux_caniveau_trans": null,
+              "niveau_murs_lateraux_caniveau_trans_beton": null,
+              "niveau_murs_lateraux_caniveau_trans_chainage": null,
+              "dalle_couverture": {
+                "type_dalle_caniveau_trans": null,
+                "niveau_execution_coulee_caniveau_trans": null,
+                "niveau_execution_prefabrique_caniveau_trans": null
+              }
+            },
+            "caniveau_photo_amont": null,
+            "caniveau_photo_aval": null,
+            "caniveau_photo_dessous": null
+          },
+          "structure": {
+            "structure_note": null
+          },
+          "equipements": {
+            "barbacanes_bouchees": null,
+            "barbacanes_obs": null,
+            "vegetation_tablier": null,
+            "vegetation_tablier_obs": null,
+            "joints_rompus": null,
+            "joints_obs": null,
+            "garde_corps": null,
+            "signalisation": null,
+            "nids_poule_abords": null,
+            "abords_obs": null
+          },
+          "hydro_env": {
+            "embacles": null,
+            "embacles_obs": null,
+            "erosion_berges": null,
+            "erosion_obs": null,
+            "vegetation_maconnerie": null,
+            "vegetation_maconnerie_obs": null
+          },
+          "etat_global": {
+            "note_service_globale": null
+          },
+          "recommandations": {
+            "strategie": null,
+            "comment_entretien_courant": null,
+            "comment_entretien_specialise": null,
+            "comment_reparation_struct": null,
+            "comment_rehab_renfort": null,
+            "comment_remplacement": null
+          },
+          "photos_ouvrage": {
+            "photo_ouvrage_1": null,
+            "photo_ouvrage_2": null,
+            "photo_ouvrage_3": null
+          }
+        },
+        "passage_niveau": {
+          "pk_passage_niveau": null,
+          "presence_signalisation": null,
+          "photo_signalisation_passage_niveau": null,
+          "barriere_passage": null,
+          "photo_barriere_securite": null,
+          "photo_passage_niveau": null
+        },
+        "pkf_segment_01": {
+          "pkf_segment": 0.5501,
+          "largeur_chaussee_fin": 7.001,
+          "pk_fin_segment_photo": "1772017873093.jpg",
+          "gps_pkf_segment": {
+            "type": "Point",
+            "coordinates": [
+              15.2765452,
+              -4.3394949,
+              339.5
+            ],
+            "properties": {
+              "accuracy": 4.966
+            }
+          }
+        },
+        "__id": "79ad8da6eeb3d40e8b02c30fab2ccecd6bd85927",
+        "__Submissions-id": "uuid:27c7a295-7038-466a-95b6-36cef6992f10"
+      },
+      {
+        "segment_no": "3",
+        "segment_header": null,
+        "pkf_prev": "0.5501",
+        "statut_troncon_01": {
+          "type_segment": "route",
+          "statut_segment": "fini",
+          "pk0_segment": 0.5501,
+          "pk0_segment_photo": "1772017911920.jpg",
+          "gps_pk0_segment": {
+            "type": "Point",
+            "coordinates": [
+              15.2765677,
+              -4.3395069,
+              339.9
+            ],
+            "properties": {
+              "accuracy": 4.72
+            }
+          }
+        },
+        "type_revetement_fini": null,
+        "segment_route": {
+          "largeur_chaussee_debut": null,
+          "nb_bandes": null,
+          "niveau": null,
+          "opt1": {
+            "equipement_terrassement": null,
+            "materiaux_terrassement": null
+          },
+          "group_opt1": {
+            "compactage_verif": null,
+            "compactage_photo": null,
+            "nivellement_verif": null,
+            "nivellement_photo": null,
+            "epaisseur_verif": null,
+            "epaisseur_photo": null
+          },
+          "opt2": {
+            "equipement_corps_chaussee": null,
+            "materiaux_corps_chaussee": null,
+            "qualite_materiaux_verif": null
+          },
+          "group_opt2": {
+            "qualite_materiaux_photo": null,
+            "impregnation_photo": null
+          },
+          "opt3": {
+            "equipement_revetement": null,
+            "materiaux_revetement": null,
+            "type_revetement": null
+          },
+          "impregnation_verif": null,
+          "technologie_curage": null,
+          "group_opt3": {
+            "curage_photo": null,
+            "qualite_joints": null,
+            "joints_photo": null,
+            "qualite_beton": null,
+            "qualite_beton_photo": null,
+            "aspect_visuel_asphalte": null,
+            "aspect_visuel_beton": null,
+            "aspect_photo": null
+          },
+          "assainissement": {
+            "assain_prevus": null
+          },
+          "assain_obs_global": null,
+          "signalisation_securite": {
+            "barriere_protection": null,
+            "barriere_photo": null,
+            "epi": null,
+            "epi_photo": null,
+            "trafic_segment": null,
+            "type_trafic": null,
+            "signaleurs_extremites": null,
+            "gestion_trafic_alternative": null,
+            "marquage_signalisation": null
+          },
+          "signalisation_securite_01": {},
+          "environnement": {
+            "dechets": {
+              "evacuation_deblais": null,
+              "deblais_photo": null,
+              "restes_enrobes_dechets": null,
+              "dechets_photo": null
+            },
+            "nuisances": {
+              "arrosage_anti_poussiere": null,
+              "vibrations_compactage": null,
+              "nuisance_sonore": null
+            },
+            "nuisances_01": {}
+          }
+        },
+        "type_ouvrage_non_debute": null,
+        "ouvrage_franchissement": {
+          "identification_ouvrage": {
+            "type_ouvrage": null,
+            "largeur_ouvrage": null,
+            "longueur_ouvrage": null,
+            "obstacles_ouvrages_franchis": null,
+            "denomination_ouvrage": null
+          },
+          "evaluation_ouvrage": {
+            "situation_pont": null,
+            "niveau_infrastructure": {
+              "niveau_infrastructure_fouille": null,
+              "niveau_infrastructure_radie_amont": null,
+              "niveau_infrastructure_radie_aval": null,
+              "nombre_piles": null,
+              "nombre_piles_coffrage": null,
+              "nombre_piles_armature": null,
+              "nombre_piles_betonnage": null,
+              "nombre_piles_decroffrage": null,
+              "niveau_infrastructure_culee_amont": null,
+              "niveau_infrastructure_culee_aval": null,
+              "existance_appareil_appui": null,
+              "alignement_appareil_appui": null,
+              "fixation_appareil_appui": null,
+              "controle_appareil_appui": null
+            },
+            "niveau_superstructure": {
+              "niveau_superfrastructure_poutre_longitudinale": null,
+              "beton_superstructure": null,
+              "dalle_superstructure": null,
+              "dalle_acces_superstructure": null,
+              "garde_corps_superstructure": null,
+              "note_superstructure_assainissement": null,
+              "vegetalisation_superstructure": null,
+              "signalisation_superstructure": null,
+              "note_superstructure_finition": null,
+              "peinture_superstructure": null,
+              "marquage_superstructure": null
+            },
+            "groupe_comment_pont_construction": {},
+            "situation_buse": null,
+            "evaluation_buse_existant": {
+              "etat_visuel_buse": null,
+              "affouillement_amont": null,
+              "affouillement_aval": null
+            },
+            "evaluation_buse_construction": {
+              "buse_construction": null
+            },
+            "groupe_comment_buse_construction": {},
+            "situation_dalot": null,
+            "evaluation_dalo_existant": {
+              "etat_ecoulement_dalot": null
+            },
+            "evaluation_dalot_construction": {
+              "niveau_execution_dalot": null,
+              "etat_niveau_execution_dalot_fouille": null,
+              "etat_niveau_execution_dalot": null
+            },
+            "groupe_comment_dalot_construction": {},
+            "situation_caniveau_trans": null,
+            "evaluation_caniveau_existant": {
+              "inspection_visuelle": {
+                "epaisseur_dalle": null,
+                "degradation_caniveau": null,
+                "fissure_caniveau": null,
+                "corrosion_caniveau": null,
+                "nivellement_caniveau": null
+              },
+              "etat_ecoulement_caniveau": null
+            },
+            "evaluation_caniveau_construction": {
+              "niveau_caniveau_trans_fouille": null,
+              "niveau_caniveau_trans_fondation": null,
+              "murs_lateraux_caniveau_trans": null,
+              "niveau_murs_lateraux_caniveau_trans_beton": null,
+              "niveau_murs_lateraux_caniveau_trans_chainage": null,
+              "dalle_couverture": {
+                "type_dalle_caniveau_trans": null,
+                "niveau_execution_coulee_caniveau_trans": null,
+                "niveau_execution_prefabrique_caniveau_trans": null
+              }
+            },
+            "caniveau_photo_amont": null,
+            "caniveau_photo_aval": null,
+            "caniveau_photo_dessous": null
+          },
+          "structure": {
+            "structure_note": null
+          },
+          "equipements": {
+            "barbacanes_bouchees": null,
+            "barbacanes_obs": null,
+            "vegetation_tablier": null,
+            "vegetation_tablier_obs": null,
+            "joints_rompus": null,
+            "joints_obs": null,
+            "garde_corps": null,
+            "signalisation": null,
+            "nids_poule_abords": null,
+            "abords_obs": null
+          },
+          "hydro_env": {
+            "embacles": null,
+            "embacles_obs": null,
+            "erosion_berges": null,
+            "erosion_obs": null,
+            "vegetation_maconnerie": null,
+            "vegetation_maconnerie_obs": null
+          },
+          "etat_global": {
+            "note_service_globale": null
+          },
+          "recommandations": {
+            "strategie": null,
+            "comment_entretien_courant": null,
+            "comment_entretien_specialise": null,
+            "comment_reparation_struct": null,
+            "comment_rehab_renfort": null,
+            "comment_remplacement": null
+          },
+          "photos_ouvrage": {
+            "photo_ouvrage_1": null,
+            "photo_ouvrage_2": null,
+            "photo_ouvrage_3": null
+          }
+        },
+        "passage_niveau": {
+          "pk_passage_niveau": null,
+          "presence_signalisation": null,
+          "photo_signalisation_passage_niveau": null,
+          "barriere_passage": null,
+          "photo_barriere_securite": null,
+          "photo_passage_niveau": null
+        },
+        "pkf_segment_01": {
+          "pkf_segment": 0.8891,
+          "largeur_chaussee_fin": 7.001,
+          "pk_fin_segment_photo": "1772018264519.jpg",
+          "gps_pkf_segment": {
+            "type": "Point",
+            "coordinates": [
+              15.2740144,
+              -4.3396186,
+              268.1
+            ],
+            "properties": {
+              "accuracy": 4.95
+            }
+          }
+        },
+        "__id": "ad8a2a31ea1407458fb4a6937c494d95150d395d",
+        "__Submissions-id": "uuid:27c7a295-7038-466a-95b6-36cef6992f10"
+      }
+    ],
+    "segments__hydratedAt": "2026-03-04T15:03:01.174Z",
+    "segments__odataNavigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/etat_troncon/segments"
+  },
+  "pk_fin_troncon_01": {
+    "pk_fin_troncon": 0.8891,
+    "pk_fin_photo": "1772018322139.jpg"
+  },
+  "cloture_collecte_segment": {
+    "note_gestionnaire": null,
+    "point_vue_gestion@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/cloture_collecte_segment/point_vue_gestion",
+    "point_vue_usagers@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/cloture_collecte_segment/point_vue_usagers"
+  },
+  "avis_global": "acceptable_condition",
+  "panneau_chantier_sortie": "non",
+  "panneau_photo_sortie": null,
+  "conclusion_rapport": {
+    "conclusion_points_positif@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/conclusion_rapport/conclusion_points_positif",
+    "conclusion_points_ameliore@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/conclusion_rapport/conclusion_points_ameliore",
+    "conclusion_recommandations@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/conclusion_rapport/conclusion_recommandations"
+  },
+  "gps_rapport_troncon_01": {
+    "gps_rapport_troncon": {
+      "type": "Point",
+      "coordinates": [
+        15.2739616,
+        -4.3396218,
+        269.1
+      ],
+      "properties": {
+        "accuracy": 5
+      }
+    }
+  },
+  "meta": {
+    "instanceID": "uuid:27c7a295-7038-466a-95b6-36cef6992f10",
+    "instanceName": "6 - 2026-02-28"
+  },
+  "__id": "uuid:27c7a295-7038-466a-95b6-36cef6992f10",
+  "__system": {
+    "submissionDate": "2026-02-28T20:32:22.774Z",
+    "updatedAt": null,
+    "submitterId": "12",
+    "submitterName": "equipe_1",
+    "attachmentsPresent": 9,
+    "attachmentsExpected": 9,
+    "status": null,
+    "reviewState": null,
+    "deviceId": "collect:EkO1IwXN6szqSRG8",
+    "edits": 0,
+    "formVersion": "1.0.30",
+    "deletedAt": null
+  },
+  "group_avis_global@odata.navigationLink": "Submissions('uuid%3A27c7a295-7038-466a-95b6-36cef6992f10')/group_avis_global",
+  "instanceId": "uuid:27c7a295-7038-466a-95b6-36cef6992f10",
+  "admin_conformite.info_generales_02.pk_debut_photo_url": "/api/getAttachment?instanceId=uuid%3A27c7a295-7038-466a-95b6-36cef6992f10&filename=1772016732328.jpg",
+  "pk_fin_troncon_01.pk_fin_photo_url": "/api/getAttachment?instanceId=uuid%3A27c7a295-7038-466a-95b6-36cef6992f10&filename=1772018322139.jpg",
+  "attachments": [
+    {
+      "filename": "1772016732328.jpg",
+      "fieldPath": "admin_conformite.info_generales_02.pk_debut_photo",
+      "proxyUrl": "/api/getAttachment?instanceId=uuid%3A27c7a295-7038-466a-95b6-36cef6992f10&filename=1772016732328.jpg"
+    },
+    {
+      "filename": "1772018322139.jpg",
+      "fieldPath": "pk_fin_troncon_01.pk_fin_photo",
+      "proxyUrl": "/api/getAttachment?instanceId=uuid%3A27c7a295-7038-466a-95b6-36cef6992f10&filename=1772018322139.jpg"
+    }
+  ]
+}
