@@ -118,6 +118,7 @@ program
   .option('--backfill-media', 'for submissions already in Mongo, upload missing media (S3/GridFS) by scanning stored fields (incl hydrated segments) and update attachments[]')
   .option('--segments-force', 'overwrite existing etat_troncon.segments (default: skip if already present)')
   .option('--media-force', 're-upload media even if already present in attachments (default: skip)')
+  .option('--backfill-doc-concurrency <n>', 'max concurrent Mongo submissions to process during --backfill-media', parseInt10, 2)
   .option('--pageSize <n>', 'page size', parseInt10, 200)
   .option('--limit <n>', 'max number of submissions to process per run', parseInt10)
   .option('--orderby <expr>', 'OData $orderby expression (e.g. "__system/submissionDate asc")', '')
@@ -512,7 +513,7 @@ async function backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, pr
   const col = db.collection(`odk_submissions_${formId}`);
   const timeoutMs = opts.navTimeoutMs || 60000;
   const mediaConcurrency = opts.mediaConcurrency || 2;
-  const docConcurrency = 2;
+  const docConcurrency = opts.backfillDocConcurrency || 2;
 
   let sinceIso = null;
   if (opts.since) {
