@@ -278,6 +278,33 @@ Le script [src/odk-migrate.js](src/odk-migrate.js) peut :
 
 Pour désactiver le transfert binaire (ne garder que des liens proxy), utilisez `--skip-media`.
 
+### Backfill médias (Mongo → ODK media → S3/GridFS → Mongo)
+
+Si vos submissions sont déjà en Mongo et que vous avez ensuite hydraté des champs (ex: `etat_troncon.segments`) contenant **d’autres photos**, vous pouvez compléter `attachments[]` sans relancer une hydratation OData profonde :
+
+```bash
+node src/odk-migrate.js \
+   --form <xmlFormId> \
+   --project 1 \
+   --since 2026-02-01T00:00:00.000Z \
+   --until 2026-03-01T00:00:00.000Z \
+   --backfill-media \
+   --once
+```
+
+Mode ciblé (une submission) :
+
+```bash
+node src/odk-migrate.js \
+   --form <xmlFormId> \
+   --project 1 \
+   --instance uuid:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+   --backfill-media \
+   --once
+```
+
+Par défaut, le backfill **skip** les fichiers déjà présents dans `attachments[]` (S3/GridFS). Pour forcer un re-upload : `--media-force`.
+
 ### Compression d'images (optionnel)
 
 Pour faciliter l'usage dans le front (images plus légères), vous pouvez activer une compression avant upload S3.

@@ -115,7 +115,9 @@ program
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
   .option('--backfill-segments', 'for submissions already in Mongo, hydrate only etat_troncon/segments via OData and update docs in-place')
+  .option('--backfill-media', 'for submissions already in Mongo, upload missing media (S3/GridFS) by scanning stored fields (incl hydrated segments) and update attachments[]')
   .option('--segments-force', 'overwrite existing etat_troncon.segments (default: skip if already present)')
+  .option('--media-force', 're-upload media even if already present in attachments (default: skip)')
   .option('--pageSize <n>', 'page size', parseInt10, 200)
   .option('--limit <n>', 'max number of submissions to process per run', parseInt10)
   .option('--orderby <expr>', 'OData $orderby expression (e.g. "__system/submissionDate asc")', '')
@@ -317,6 +319,54 @@ function detectMediaFields(obj) {
   return media;
 }
 
+function isMediaFilenameOnly(v) {
+  if (typeof v !== 'string') return false;
+  const s = v.trim();
+  if (!s) return false;
+  // Exclude URLs / proxy strings; we only want raw filenames stored by ODK.
+  if (s.includes('://')) return false;
+  if (s.startsWith('/')) return false;
+  if (s.includes('?') || s.includes('&')) return false;
+  if (s.includes('\\')) return false;
+  if (s.includes('/')) return false;
+  return /\.(jpg|jpeg|png|gif|mp4|wav|mp3|pdf)$/i.test(s);
+}
+
+function detectMediaFilenames(obj) {
+  const media = [];
+  const seen = new Set();
+  function walk(o, path = []) {
+    if (o === null || typeof o === 'undefined') return;
+    if (typeof o === 'string') {
+      if (isMediaFilenameOnly(o)) {
+        const key = `${path.join('.')}::${o}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          media.push({ path: path.join('.'), filename: o });
+        }
+      }
+      return;
+    }
+    if (Array.isArray(o)) {
+      o.forEach((it, idx) => walk(it, [...path, idx]));
+      return;
+    }
+    if (typeof o === 'object') {
+      // avoid re-scanning attachments list itself (would duplicate filenames)
+      if (path.length === 1 && path[0] === 'attachments') return;
+      for (const k of Object.keys(o)) {
+        if (k === 'attachments') {
+          // skip the attachments array
+          continue;
+        }
+        walk(o[k], [...path, k]);
+      }
+    }
+  }
+  walk(obj, []);
+  return media;
+}
+
 function parseODataCollection(data) {
   if (!data) return [];
   if (Array.isArray(data)) return data;
@@ -456,6 +506,240 @@ async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink
 
   logger.info({ formId, scanned, hydrated, skipped, failed, sinceIso, untilIso }, 'finished backfill-segments');
   return { scanned, hydrated, skipped, failed, sinceIso, untilIso };
+}
+
+async function backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, projectId, formId }) {
+  const col = db.collection(`odk_submissions_${formId}`);
+  const timeoutMs = opts.navTimeoutMs || 60000;
+  const mediaConcurrency = opts.mediaConcurrency || 2;
+  const docConcurrency = 2;
+
+  let sinceIso = null;
+  if (opts.since) {
+    const d = parseSinceInput(opts.since);
+    sinceIso = d.toISOString();
+  }
+  let untilIso = null;
+  if (opts.until) {
+    const d = parseSinceInput(opts.until);
+    untilIso = d.toISOString();
+  }
+
+  const filter = {};
+  if (sinceIso || untilIso) {
+    filter['__system.submissionDate'] = {};
+    if (sinceIso) filter['__system.submissionDate'].$gte = sinceIso;
+    if (untilIso) filter['__system.submissionDate'].$lt = untilIso;
+  }
+  if (opts.instance) {
+    const targetId = normalizeInstanceId(opts.instance);
+    filter.instanceId = targetId;
+  }
+
+  const projection = { _id: 0, instanceId: 1, agent_id: 1, '__system.submissionDate': 1 };
+
+  const hardLimit = typeof opts.limit === 'number' && !isNaN(opts.limit) && opts.limit > 0 ? opts.limit : null;
+
+  let scanned = 0;
+  let touchedDocs = 0;
+  let uploaded = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  logger.info({ formId, sinceIso, untilIso, timeoutMs, mediaConcurrency, docConcurrency, hardLimit, hasS3: !!(s3client && s3bucket) }, 'starting backfill-media (Mongo -> ODK media -> S3/GridFS -> Mongo)');
+
+  const docLimit = pLimit(docConcurrency);
+  const pending = [];
+
+  // same proxy template logic as processSubmission
+  const proxyTemplate = process.env.ODK_ATTACHMENT_PROXY_TEMPLATE || process.env.ODK_ATTACHMENT_PROXY || '/api/getAttachment?instanceId={instanceId}&filename={filename}';
+
+  const cursor = col.find(filter).project(projection);
+  for await (const row of cursor) {
+    if (hardLimit && scanned >= hardLimit) break;
+    scanned += 1;
+
+    pending.push(docLimit(async () => {
+      const instanceId = row && row.instanceId ? String(row.instanceId) : null;
+      if (!instanceId) return;
+
+      // Load full doc (we need hydrated segments already stored in Mongo)
+      let doc;
+      try {
+        doc = await getSubmission(formId, instanceId);
+      } catch (err) {
+        failed += 1;
+        logger.warn({ err, formId, instanceId }, 'backfill-media failed loading Mongo doc');
+        return;
+      }
+      if (!doc) {
+        skipped += 1;
+        return;
+      }
+
+      const attachments = Array.isArray(doc.attachments) ? doc.attachments : [];
+      const existingByFilename = new Map(attachments.map(a => [a && a.filename, a]).filter(([k]) => k));
+
+      const medias = detectMediaFilenames(doc);
+      if (!medias.length) {
+        skipped += 1;
+        return;
+      }
+
+      const perMediaLimit = pLimit(Math.max(1, parseInt(mediaConcurrency, 10) || 1));
+      const results = await Promise.all(medias.map(m => perMediaLimit(async () => {
+        const filename = m.filename;
+        const fieldPath = m.path;
+
+        const prior = existingByFilename.get(filename);
+        if (!opts.mediaForce && prior && (prior.s3 || prior.gridFs)) {
+          return null;
+        }
+
+        const att = prior && typeof prior === 'object' ? { ...prior } : { filename, fieldPath };
+        att.filename = filename;
+        att.fieldPath = fieldPath;
+
+        // always (re)build proxy URL
+        att.proxyUrl = proxyTemplate.replace('{instanceId}', encodeURIComponent(instanceId))
+          .replace('{filename}', encodeURIComponent(filename))
+          .replace('{formId}', encodeURIComponent(formId))
+          .replace('{projectId}', encodeURIComponent(projectId));
+
+        const fieldUpdates = {};
+
+        try {
+          if (!opts.skipMedia) {
+            const mediaRes = await odk.downloadMedia(projectId, formId, instanceId, filename);
+            const inputContentType = (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream';
+
+            if (s3client && s3bucket) {
+              const key = `${formId}/${instanceId}/${filename}`;
+
+              if (shouldCompressOdkImagesForS3() && isCompressibleImage(filename, inputContentType)) {
+                let originalTmp = null;
+                let compressedTmp = null;
+                try {
+                  const inputStream = mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes;
+                  originalTmp = await streamToTempFile(inputStream, 'odk_img_original');
+                  compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
+                  const url = await uploadToS3(
+                    s3client,
+                    s3bucket,
+                    key,
+                    {
+                      stream: fs.createReadStream(compressedTmp.tmpPath),
+                      headers: {
+                        'content-length': String(compressedTmp.size),
+                        'content-type': compressedTmp.contentType,
+                      },
+                    },
+                    compressedTmp.contentType
+                  );
+                  att.s3 = url;
+                  att.s3Compressed = true;
+                  att.s3ContentType = compressedTmp.contentType;
+                  att.s3Bytes = compressedTmp.size;
+                  fieldUpdates[`${fieldPath}_url`] = url;
+                } catch (err) {
+                  logger.warn({ err, formId, instanceId, filename }, 'image compression failed during backfill-media; uploading original');
+                  // Best-effort fallback: upload original (we already buffered it on disk).
+                  let url;
+                  if (originalTmp && originalTmp.tmpPath) {
+                    const st = await fs.promises.stat(originalTmp.tmpPath);
+                    url = await uploadToS3(
+                      s3client,
+                      s3bucket,
+                      key,
+                      {
+                        stream: fs.createReadStream(originalTmp.tmpPath),
+                        headers: {
+                          'content-length': String(st.size),
+                          'content-type': inputContentType,
+                        },
+                      },
+                      inputContentType
+                    );
+                  } else {
+                    const mediaRes2 = await odk.downloadMedia(projectId, formId, instanceId, filename);
+                    url = await uploadToS3(
+                      s3client,
+                      s3bucket,
+                      key,
+                      mediaRes2,
+                      (mediaRes2 && mediaRes2.headers && (mediaRes2.headers['content-type'] || mediaRes2.headers['Content-Type'])) || inputContentType
+                    );
+                  }
+                  att.s3 = url;
+                  fieldUpdates[`${fieldPath}_url`] = url;
+                } finally {
+                  try { if (originalTmp && originalTmp.tmpPath) await fs.promises.unlink(originalTmp.tmpPath); } catch (_) { /* ignore */ }
+                  try { if (compressedTmp && compressedTmp.tmpPath) await fs.promises.unlink(compressedTmp.tmpPath); } catch (_) { /* ignore */ }
+                }
+              } else {
+                const url = await uploadToS3(s3client, s3bucket, key, mediaRes, inputContentType);
+                att.s3 = url;
+                fieldUpdates[`${fieldPath}_url`] = url;
+              }
+            } else {
+              const res = await uploadToGridFS(gridfsBucket, `${formId}_${instanceId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
+              att.gridFs = res;
+              fieldUpdates[`${fieldPath}_gridfs`] = res;
+            }
+          } else {
+            // proxy-only
+            fieldUpdates[`${fieldPath}_url`] = att.proxyUrl;
+          }
+        } catch (err) {
+          failed += 1;
+          logger.warn({ err, formId, instanceId, filename, fieldPath }, 'backfill-media failed downloading/uploading');
+          return null;
+        }
+
+        return { filename, att, fieldUpdates, hadPrior: !!prior };
+      })));
+
+      const ok = results.filter(Boolean);
+      if (!ok.length) {
+        skipped += 1;
+        return;
+      }
+
+      for (const r of ok) {
+        for (const [k, v] of Object.entries(r.fieldUpdates || {})) {
+          doc[k] = v;
+        }
+        if (r.hadPrior) {
+          const idx = attachments.findIndex(a => a && a.filename === r.filename);
+          if (idx !== -1) attachments[idx] = r.att;
+          else attachments.push(r.att);
+        } else {
+          attachments.push(r.att);
+        }
+        existingByFilename.set(r.filename, r.att);
+      }
+
+      uploaded += ok.length;
+      doc.attachments = attachments;
+      try {
+        await upsertSubmission(formId, instanceId, doc);
+        touchedDocs += 1;
+      } catch (err) {
+        failed += 1;
+        logger.warn({ err, formId, instanceId }, 'backfill-media failed replacing Mongo doc');
+        return;
+      }
+    }));
+
+    if (pending.length >= 500) {
+      await Promise.all(pending.splice(0, pending.length));
+    }
+  }
+
+  if (pending.length) await Promise.all(pending);
+
+  logger.info({ formId, scanned, touchedDocs, uploaded, skipped, failed, sinceIso, untilIso }, 'finished backfill-media');
+  return { scanned, touchedDocs, uploaded, skipped, failed, sinceIso, untilIso };
 }
 
 async function hydrateNavigationLinks(root, odk, {
@@ -893,6 +1177,11 @@ async function runOnce() {
     if (u.startsWith('/')) return u;
     if (svcRoot) return `${svcRoot}${u}`;
     return u;
+  }
+
+  if (opts.backfillMedia) {
+    await backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, projectId, formId });
+    return;
   }
 
   if (opts.backfillSegments) {
