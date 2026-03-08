@@ -150,6 +150,46 @@ Options utiles (voir `.env.example`) :
 - `--expand` et/ou hydration `@odata.navigationLink` pour récupérer les repeats/segments
 - Médias : S3/Spaces via `S3_BUCKET`+`AWS_ACCESS_KEY_ID`+`AWS_SECRET_ACCESS_KEY`, sinon stockage Mongo **GridFS** (`odk_media`)
 
+### Compression des photos (recommandé)
+
+Par défaut, les images sont uploadées **telles quelles**. Pour éviter des photos à ~4MiB, activez la compression (resize + qualité JPEG) avant l’upload S3.
+
+Dans `.env` :
+
+```env
+ODK_MEDIA_COMPRESS_IMAGES=true
+
+# Ajustez selon vos besoins
+ODK_MEDIA_MAX_WIDTH=1600
+ODK_MEDIA_JPEG_QUALITY=75
+ODK_MEDIA_PNG_COMPRESSION_LEVEL=9
+
+# (optionnel) timeouts/retries réseau
+S3_PUT_TIMEOUT_MS=180000
+ODK_MEDIA_RETRIES=3
+```
+
+Notes :
+- La compression s’applique uniquement aux `.jpg/.jpeg/.png` et seulement quand S3 est configuré.
+- Pour **recompresser** des médias déjà uploadés, relancez un backfill avec `--media-force` (ça ré-uploade et écrase l’objet S3 au même `key`).
+
+Exemple (fenêtre de dates) :
+
+```bash
+ODK_MEDIA_COMPRESS_IMAGES=true \
+ODK_MEDIA_MAX_WIDTH=1600 \
+ODK_MEDIA_JPEG_QUALITY=75 \
+node src/odk-migrate.js \
+   --form <xmlFormId> \
+   --project 1 \
+   --since 2026-03-08 \
+   --until 2026-03-10 \
+   --ignore-state \
+   --backfill-media \
+   --media-force \
+   --once
+```
+
 ### 2) Lancer une migration
 
 Lister les formulaires d'un projet (pour récupérer le `xmlFormId` à passer à `--form`) :

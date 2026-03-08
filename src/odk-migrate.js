@@ -18,6 +18,62 @@ let sharp = null;
 const pipeline = promisify(stream.pipeline);
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getErrCode(err) {
+  if (!err) return null;
+  return err.code || err.errno || err.name || null;
+}
+
+function isRetryableHttpStatus(status) {
+  const n = Number(status);
+  if (!Number.isFinite(n)) return false;
+  if (n === 408) return true;
+  if (n === 409) return true;
+  if (n === 425) return true;
+  if (n === 429) return true;
+  if (n >= 500 && n <= 599) return true;
+  return false;
+}
+
+function isRetryableNetworkErr(err) {
+  const code = String(getErrCode(err) || '').toUpperCase();
+  const msg = String(err && err.message ? err.message : '').toUpperCase();
+  if (code.includes('TIMEOUT') || msg.includes('TIMEOUT')) return true;
+  if (code === 'ETIMEDOUT') return true;
+  if (code === 'ECONNRESET') return true;
+  if (code === 'EPIPE') return true;
+  if (code === 'ENOTFOUND') return true;
+  if (code === 'EAI_AGAIN') return true;
+  if (code === 'ECONNABORTED') return true;
+  if (code === 'ERR_STREAM_PREMATURE_CLOSE') return true;
+  return false;
+}
+
+async function withRetries(label, fn, {
+  retries = parseIntEnv('ODK_MEDIA_RETRIES', 3),
+  baseDelayMs = parseIntEnv('ODK_MEDIA_RETRY_BASE_MS', 750),
+  maxDelayMs = parseIntEnv('ODK_MEDIA_RETRY_MAX_MS', 8000),
+} = {}) {
+  let lastErr;
+  for (let attempt = 1; attempt <= Math.max(1, retries + 1); attempt += 1) {
+    try {
+      return await fn(attempt);
+    } catch (err) {
+      lastErr = err;
+      const status = err && err.response && err.response.status;
+      const retryable = isRetryableNetworkErr(err) || isRetryableHttpStatus(status);
+      if (!retryable || attempt > retries) throw err;
+      const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** (attempt - 1)));
+      logger.warn({ label, attempt, retries, delay, status, code: getErrCode(err) }, 'retrying after transient error');
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
 function parseBoolEnv(name, defaultValue = false) {
   const raw = process.env[name];
   if (raw === null || typeof raw === 'undefined') return defaultValue;
@@ -32,6 +88,22 @@ function parseIntEnv(name, defaultValue) {
   if (raw === null || typeof raw === 'undefined' || String(raw).trim() === '') return defaultValue;
   const n = Number.parseInt(String(raw), 10);
   return Number.isFinite(n) ? n : defaultValue;
+}
+
+async function sendS3WithTimeout(s3client, cmd) {
+  const timeoutMs = parseIntEnv('S3_PUT_TIMEOUT_MS', 180000);
+  if (!timeoutMs || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return s3client.send(cmd);
+  }
+  const ac = new AbortController();
+  const t = setTimeout(() => {
+    try { ac.abort(); } catch (_) { /* ignore */ }
+  }, timeoutMs);
+  try {
+    return await s3client.send(cmd, { abortSignal: ac.signal });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 function shouldCompressOdkImagesForS3() {
@@ -72,8 +144,10 @@ async function compressImageFileToTemp({ inputPath, filename, contentType }) {
     }
   }
 
-  const maxWidth = parseIntEnv('ODK_MEDIA_MAX_WIDTH', 1920);
-  const jpegQuality = parseIntEnv('ODK_MEDIA_JPEG_QUALITY', 80);
+  // Defaults aim to reduce size materially while staying visually OK for audits.
+  // Override via env if you need higher fidelity.
+  const maxWidth = parseIntEnv('ODK_MEDIA_MAX_WIDTH', 1600);
+  const jpegQuality = parseIntEnv('ODK_MEDIA_JPEG_QUALITY', 75);
   const pngCompressionLevel = parseIntEnv('ODK_MEDIA_PNG_COMPRESSION_LEVEL', 9);
 
   const outPrefix = 'odk_img_compressed';
@@ -115,8 +189,10 @@ program
   .option('--once', 'run once and exit')
   .option('--daemon', 'run continuously')
   .option('--backfill-segments', 'for submissions already in Mongo, hydrate only etat_troncon/segments via OData and update docs in-place')
+  .option('--backfill-point-vue-usagers', 'for submissions already in Mongo, hydrate only cloture_collecte_segment/point_vue_usagers via OData and update docs in-place')
   .option('--backfill-media', 'for submissions already in Mongo, upload missing media (S3/GridFS) by scanning stored fields (incl hydrated segments) and update attachments[]')
   .option('--segments-force', 'overwrite existing etat_troncon.segments (default: skip if already present)')
+  .option('--point-vue-usagers-force', 'overwrite existing cloture_collecte_segment.point_vue_usagers (default: skip if already present)')
   .option('--media-force', 're-upload media even if already present in attachments (default: skip)')
   .option('--backfill-doc-concurrency <n>', 'max concurrent Mongo submissions to process during --backfill-media', parseInt10, 2)
   .option('--pageSize <n>', 'page size', parseInt10, 200)
@@ -243,18 +319,9 @@ async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
   }
 
   const acl = process.env.S3_PUBLIC_ACL || 'public-read';
-  // If we know the size, stream directly. Otherwise buffer once to a temp file.
-  // (Important: we must not try to read the same stream twice.)
-  if (contentLength) {
-    const pass = new stream.PassThrough();
-    actualStream.pipe(pass);
-    const params = { Bucket: bucket, Key: key, Body: pass, ContentType: contentType, ACL: acl };
-    const n = parseInt(contentLength, 10);
-    if (!isNaN(n)) params.ContentLength = n;
-    const cmd = new PutObjectCommand(params);
-    await s3client.send(cmd);
-    return buildPublicUrl(bucket, key);
-  }
+  // Always buffer to a temp file so uploads can be retried safely.
+  // (AWS SDK cannot retry streaming bodies; buffering lets us reopen a new stream per attempt.)
+  const providedLength = contentLength ? parseInt(String(contentLength), 10) : NaN;
 
   const tmpName = `odk_upload_${Date.now()}_${Math.random().toString(36).slice(2)}`;
   const tmpPath = path.join(os.tmpdir(), tmpName);
@@ -262,11 +329,20 @@ async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
     await pipeline(actualStream, fs.createWriteStream(tmpPath));
     const st = await fs.promises.stat(tmpPath);
     const size = st.size;
-    const readStream = fs.createReadStream(tmpPath);
-    const params2 = { Bucket: bucket, Key: key, Body: readStream, ContentType: contentType, ContentLength: size, ACL: acl };
-    const cmd2 = new PutObjectCommand(params2);
-    await s3client.send(cmd2);
-    return buildPublicUrl(bucket, key);
+    const effectiveSize = Number.isFinite(providedLength) && providedLength >= 0 ? providedLength : size;
+
+    const url = await withRetries('s3.putObject', async () => {
+      const readStream = fs.createReadStream(tmpPath);
+      const params2 = { Bucket: bucket, Key: key, Body: readStream, ContentType: contentType, ContentLength: effectiveSize, ACL: acl };
+      const cmd2 = new PutObjectCommand(params2);
+      await sendS3WithTimeout(s3client, cmd2);
+      return buildPublicUrl(bucket, key);
+    }, {
+      retries: parseIntEnv('S3_PUT_RETRIES', 3),
+      baseDelayMs: parseIntEnv('S3_PUT_RETRY_BASE_MS', 750),
+      maxDelayMs: parseIntEnv('S3_PUT_RETRY_MAX_MS', 8000),
+    });
+    return url;
   } finally {
     try { await fs.promises.unlink(tmpPath); } catch (e) { /* ignore */ }
   }
@@ -307,7 +383,7 @@ function detectMediaFields(obj) {
     if (!o || typeof o !== 'object') return;
     for (const k of Object.keys(o)) {
       const v = o[k];
-      if (typeof v === 'string' && v.match(/\.(jpg|jpeg|png|gif|mp4|wav|mp3|pdf)$/i)) {
+      if (typeof v === 'string' && v.match(/\.(jpg|jpeg|png|gif|mp4|wav|mp3|m4a|aac|ogg|amr|pdf)$/i)) {
         media.push({ path: [...path, k].join('.'), filename: v });
       } else if (Array.isArray(v)) {
         v.forEach((it, idx) => walk(it, [...path, k, idx]));
@@ -330,7 +406,34 @@ function isMediaFilenameOnly(v) {
   if (s.includes('?') || s.includes('&')) return false;
   if (s.includes('\\')) return false;
   if (s.includes('/')) return false;
-  return /\.(jpg|jpeg|png|gif|mp4|wav|mp3|pdf)$/i.test(s);
+  return /\.(jpg|jpeg|png|gif|mp4|wav|mp3|m4a|aac|ogg|amr|pdf)$/i.test(s);
+}
+
+function isAudioFilenameOnly(v) {
+  if (typeof v !== 'string') return false;
+  const s = v.trim();
+  if (!s) return false;
+  if (s.includes('://')) return false;
+  if (s.startsWith('/')) return false;
+  if (s.includes('?') || s.includes('&')) return false;
+  if (s.includes('\\')) return false;
+  if (s.includes('/')) return false;
+  return /\.(wav|mp3|m4a|aac|ogg|amr)$/i.test(s);
+}
+
+function shouldPutAudioInSubfolder() {
+  const v = (process.env.S3_AUDIO_SUBFOLDER || '').toString().trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'y';
+}
+
+function buildS3Key({ formId, instanceId, filename }) {
+  // Keep existing structure for images/docs/videos for backward compatibility.
+  // Optionally place audio under an "audio/" subfolder to make prefix listing lighter.
+  const base = `${formId}/${instanceId}/`;
+  if (shouldPutAudioInSubfolder() && isAudioFilenameOnly(filename)) {
+    return `${base}audio/${filename}`;
+  }
+  return `${base}${filename}`;
 }
 
 function detectMediaFilenames(obj) {
@@ -368,6 +471,41 @@ function detectMediaFilenames(obj) {
   return media;
 }
 
+function sanitizeForFilename(v) {
+  return String(v || 'unknown').replace(/[^a-zA-Z0-9_-]+/g, '_');
+}
+
+function detectAudioFilenames(obj) {
+  const out = [];
+  const seen = new Set();
+  const audioRe = /\.(wav|mp3|m4a|aac|ogg|amr)$/i;
+  function walk(o, path = []) {
+    if (o === null || typeof o === 'undefined') return;
+    if (typeof o === 'string') {
+      const s = o.trim();
+      if (s && !s.includes('://') && !s.includes('/') && audioRe.test(s)) {
+        const key = `${path.join('.')}::${s}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push({ path: path.join('.'), filename: s });
+        }
+      }
+      return;
+    }
+    if (Array.isArray(o)) {
+      o.forEach((it, idx) => walk(it, [...path, idx]));
+      return;
+    }
+    if (typeof o === 'object') {
+      for (const k of Object.keys(o)) {
+        walk(o[k], [...path, k]);
+      }
+    }
+  }
+  walk(obj, []);
+  return out;
+}
+
 function parseODataCollection(data) {
   if (!data) return [];
   if (Array.isArray(data)) return data;
@@ -387,6 +525,131 @@ function pickSegmentsNavLinkFromDoc(doc) {
   const root = doc['segments@odata.navigationLink'];
   if (root) return String(root);
   return null;
+}
+
+function pickPointVueUsagersNavLinkFromDoc(doc) {
+  if (!doc || typeof doc !== 'object') return null;
+  // Typically stored under cloture_collecte_segment.
+  if (doc.cloture_collecte_segment && typeof doc.cloture_collecte_segment === 'object') {
+    const nested = doc.cloture_collecte_segment['point_vue_usagers@odata.navigationLink'];
+    if (nested) return String(nested);
+  }
+  const root = doc['point_vue_usagers@odata.navigationLink'];
+  if (root) return String(root);
+  return null;
+}
+
+async function backfillPointVueUsagersOnly({ odk, db, projectId, formId, resolveNavLink }) {
+  const col = db.collection(`odk_submissions_${formId}`);
+  const navConcurrency = opts.navConcurrency || 6;
+  const timeoutMs = opts.navTimeoutMs || 60000;
+
+  let sinceIso = null;
+  if (opts.since) {
+    const d = parseSinceInput(opts.since);
+    sinceIso = d.toISOString();
+  }
+
+  let untilIso = null;
+  if (opts.until) {
+    const d = parseSinceInput(opts.until);
+    untilIso = d.toISOString();
+  }
+
+  const filter = {};
+  if (sinceIso || untilIso) {
+    filter['__system.submissionDate'] = {};
+    if (sinceIso) filter['__system.submissionDate'].$gte = sinceIso;
+    if (untilIso) filter['__system.submissionDate'].$lt = untilIso;
+  }
+  if (opts.instance) {
+    const targetId = normalizeInstanceId(opts.instance);
+    filter.instanceId = targetId;
+  }
+
+  const projection = {
+    _id: 0,
+    instanceId: 1,
+    '__system.submissionDate': 1,
+    cloture_collecte_segment: 1,
+    'point_vue_usagers@odata.navigationLink': 1,
+  };
+
+  const hardLimit = typeof opts.limit === 'number' && !isNaN(opts.limit) && opts.limit > 0 ? opts.limit : null;
+
+  let scanned = 0;
+  let hydrated = 0;
+  let skipped = 0;
+  let failed = 0;
+
+  logger.info({ formId, sinceIso, untilIso, navConcurrency, timeoutMs, hardLimit }, 'starting backfill-point-vue-usagers (Mongo -> ODK -> Mongo)');
+
+  const limit = pLimit(navConcurrency);
+  const pending = [];
+
+  const cursor = col.find(filter).project(projection);
+  for await (const doc of cursor) {
+    if (hardLimit && scanned >= hardLimit) break;
+    scanned += 1;
+
+    pending.push(limit(async () => {
+      const instanceId = doc && doc.instanceId ? String(doc.instanceId) : null;
+      if (!instanceId) {
+        skipped += 1;
+        return;
+      }
+
+      const existing = doc.cloture_collecte_segment && typeof doc.cloture_collecte_segment === 'object'
+        ? doc.cloture_collecte_segment.point_vue_usagers
+        : null;
+      if (!opts.pointVueUsagersForce && Array.isArray(existing) && existing.length) {
+        skipped += 1;
+        return;
+      }
+
+      const storedNavLink = pickPointVueUsagersNavLinkFromDoc(doc);
+      const fallbackNavLink = `Submissions('${encodeInstanceIdOnce(instanceId)}')/cloture_collecte_segment/point_vue_usagers`;
+      const rel = storedNavLink || fallbackNavLink;
+      const url = resolveNavLink(rel);
+
+      let items = [];
+      try {
+        const res = await odk.axios.get(url, { timeout: timeoutMs });
+        items = parseODataCollection(res.data);
+      } catch (err) {
+        failed += 1;
+        logger.warn({ err, formId, instanceId, url, rel }, 'point_vue_usagers hydration failed');
+        return;
+      }
+
+      const hydratedAt = new Date().toISOString();
+      try {
+        await col.updateOne(
+          { instanceId },
+          {
+            $set: {
+              'cloture_collecte_segment.point_vue_usagers': items,
+              'cloture_collecte_segment.point_vue_usagers__hydratedAt': hydratedAt,
+              'cloture_collecte_segment.point_vue_usagers__odataNavigationLink': rel,
+            },
+          }
+        );
+        hydrated += 1;
+      } catch (err) {
+        failed += 1;
+        logger.warn({ err, formId, instanceId }, 'failed updating Mongo with hydrated point_vue_usagers');
+      }
+    }));
+
+    if (pending.length >= navConcurrency * 4) {
+      await Promise.allSettled(pending.splice(0, pending.length));
+    }
+  }
+
+  if (pending.length) await Promise.allSettled(pending);
+
+  logger.info({ formId, scanned, hydrated, skipped, failed, sinceIso, untilIso }, 'finished backfill-point-vue-usagers');
+  return { scanned, hydrated, skipped, failed, sinceIso, untilIso };
 }
 
 async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink }) {
@@ -411,6 +674,11 @@ async function backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink
     filter['__system.submissionDate'] = {};
     if (sinceIso) filter['__system.submissionDate'].$gte = sinceIso;
     if (untilIso) filter['__system.submissionDate'].$lt = untilIso;
+  }
+
+  if (opts.instance) {
+    const targetId = normalizeInstanceId(opts.instance);
+    filter.instanceId = targetId;
   }
 
   const projection = {
@@ -515,6 +783,11 @@ async function backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, pr
   const mediaConcurrency = opts.mediaConcurrency || 2;
   const docConcurrency = opts.backfillDocConcurrency || 2;
 
+  // Apply timeout to all ODK HTTP calls (including attachment downloads).
+  if (odk && odk.axios && odk.axios.defaults) {
+    odk.axios.defaults.timeout = timeoutMs;
+  }
+
   let sinceIso = null;
   if (opts.since) {
     const d = parseSinceInput(opts.since);
@@ -611,82 +884,89 @@ async function backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, pr
 
         try {
           if (!opts.skipMedia) {
-            const mediaRes = await odk.downloadMedia(projectId, formId, instanceId, filename);
-            const inputContentType = (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream';
+            const res = await withRetries('odk.download+upload', async () => {
+              const mediaRes = await odk.downloadMedia(projectId, formId, instanceId, filename);
+              const inputContentType = (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream';
 
-            if (s3client && s3bucket) {
-              const key = `${formId}/${instanceId}/${filename}`;
+              if (s3client && s3bucket) {
+                const key = buildS3Key({ formId, instanceId, filename });
 
-              if (shouldCompressOdkImagesForS3() && isCompressibleImage(filename, inputContentType)) {
-                let originalTmp = null;
-                let compressedTmp = null;
-                try {
-                  const inputStream = mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes;
-                  originalTmp = await streamToTempFile(inputStream, 'odk_img_original');
-                  compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
-                  const url = await uploadToS3(
-                    s3client,
-                    s3bucket,
-                    key,
-                    {
-                      stream: fs.createReadStream(compressedTmp.tmpPath),
-                      headers: {
-                        'content-length': String(compressedTmp.size),
-                        'content-type': compressedTmp.contentType,
-                      },
-                    },
-                    compressedTmp.contentType
-                  );
-                  att.s3 = url;
-                  att.s3Compressed = true;
-                  att.s3ContentType = compressedTmp.contentType;
-                  att.s3Bytes = compressedTmp.size;
-                  fieldUpdates[`${fieldPath}_url`] = url;
-                } catch (err) {
-                  logger.warn({ err, formId, instanceId, filename }, 'image compression failed during backfill-media; uploading original');
-                  // Best-effort fallback: upload original (we already buffered it on disk).
-                  let url;
-                  if (originalTmp && originalTmp.tmpPath) {
-                    const st = await fs.promises.stat(originalTmp.tmpPath);
-                    url = await uploadToS3(
+                if (shouldCompressOdkImagesForS3() && isCompressibleImage(filename, inputContentType)) {
+                  let originalTmp = null;
+                  let compressedTmp = null;
+                  try {
+                    const inputStream = mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes;
+                    originalTmp = await streamToTempFile(inputStream, 'odk_img_original');
+                    compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
+                    const url = await uploadToS3(
                       s3client,
                       s3bucket,
                       key,
                       {
-                        stream: fs.createReadStream(originalTmp.tmpPath),
+                        stream: fs.createReadStream(compressedTmp.tmpPath),
                         headers: {
-                          'content-length': String(st.size),
-                          'content-type': inputContentType,
+                          'content-length': String(compressedTmp.size),
+                          'content-type': compressedTmp.contentType,
                         },
                       },
-                      inputContentType
+                      compressedTmp.contentType
                     );
-                  } else {
-                    const mediaRes2 = await odk.downloadMedia(projectId, formId, instanceId, filename);
-                    url = await uploadToS3(
-                      s3client,
-                      s3bucket,
-                      key,
-                      mediaRes2,
-                      (mediaRes2 && mediaRes2.headers && (mediaRes2.headers['content-type'] || mediaRes2.headers['Content-Type'])) || inputContentType
-                    );
+                    return {
+                      store: {
+                        s3: url,
+                        s3Compressed: true,
+                        s3ContentType: compressedTmp.contentType,
+                        s3Bytes: compressedTmp.size,
+                      },
+                      url,
+                    };
+                  } catch (err) {
+                    logger.warn({ err, formId, instanceId, filename }, 'image compression failed during backfill-media; uploading original');
+                    // Best-effort fallback: upload original (we already buffered it on disk).
+                    let url;
+                    if (originalTmp && originalTmp.tmpPath) {
+                      const st = await fs.promises.stat(originalTmp.tmpPath);
+                      url = await uploadToS3(
+                        s3client,
+                        s3bucket,
+                        key,
+                        {
+                          stream: fs.createReadStream(originalTmp.tmpPath),
+                          headers: {
+                            'content-length': String(st.size),
+                            'content-type': inputContentType,
+                          },
+                        },
+                        inputContentType
+                      );
+                    } else {
+                      const mediaRes2 = await odk.downloadMedia(projectId, formId, instanceId, filename);
+                      url = await uploadToS3(
+                        s3client,
+                        s3bucket,
+                        key,
+                        mediaRes2,
+                        (mediaRes2 && mediaRes2.headers && (mediaRes2.headers['content-type'] || mediaRes2.headers['Content-Type'])) || inputContentType
+                      );
+                    }
+                    return { store: { s3: url }, url };
+                  } finally {
+                    try { if (originalTmp && originalTmp.tmpPath) await fs.promises.unlink(originalTmp.tmpPath); } catch (_) { /* ignore */ }
+                    try { if (compressedTmp && compressedTmp.tmpPath) await fs.promises.unlink(compressedTmp.tmpPath); } catch (_) { /* ignore */ }
                   }
-                  att.s3 = url;
-                  fieldUpdates[`${fieldPath}_url`] = url;
-                } finally {
-                  try { if (originalTmp && originalTmp.tmpPath) await fs.promises.unlink(originalTmp.tmpPath); } catch (_) { /* ignore */ }
-                  try { if (compressedTmp && compressedTmp.tmpPath) await fs.promises.unlink(compressedTmp.tmpPath); } catch (_) { /* ignore */ }
                 }
-              } else {
+
                 const url = await uploadToS3(s3client, s3bucket, key, mediaRes, inputContentType);
-                att.s3 = url;
-                fieldUpdates[`${fieldPath}_url`] = url;
+                return { store: { s3: url }, url };
               }
-            } else {
-              const res = await uploadToGridFS(gridfsBucket, `${formId}_${instanceId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
-              att.gridFs = res;
-              fieldUpdates[`${fieldPath}_gridfs`] = res;
-            }
+
+              const grid = await uploadToGridFS(gridfsBucket, `${formId}_${instanceId}_${filename}`, mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes);
+              return { store: { gridFs: grid }, gridFs: grid };
+            });
+
+            if (res && res.store) Object.assign(att, res.store);
+            if (res && res.url) fieldUpdates[`${fieldPath}_url`] = res.url;
+            if (res && res.gridFs) fieldUpdates[`${fieldPath}_gridfs`] = res.gridFs;
           } else {
             // proxy-only
             fieldUpdates[`${fieldPath}_url`] = att.proxyUrl;
@@ -988,7 +1268,7 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
       if (!skipMedia && effectiveId) {
         const mediaRes = await odk.downloadMedia(projectId, formId, effectiveId, filename);
         if (s3client && s3bucket) {
-          const key = `${formId}/${effectiveId}/${filename}`;
+          const key = buildS3Key({ formId, instanceId: effectiveId, filename });
           const inputContentType = (mediaRes && mediaRes.headers && (mediaRes.headers['content-type'] || mediaRes.headers['Content-Type'])) || 'application/octet-stream';
 
           // Optional: compress images before upload to make frontend usage faster.
@@ -1071,7 +1351,31 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
 
   if (dryRun) {
     logger.info({ instanceId: effectiveId }, 'dry-run document:');
-    console.log(util.inspect(doc, { depth: 5 }));
+
+    if (parseBoolEnv('ODK_DRY_RUN_DUMP_SEGMENTS', false)) {
+      try {
+        const segments = doc && doc.etat_troncon && doc.etat_troncon.segments;
+        const audioCandidates = detectAudioFilenames(segments);
+        const outDir = process.env.ODK_DRY_RUN_OUT_DIR || path.join(__dirname, '..', 'tmp');
+        await fs.promises.mkdir(outDir, { recursive: true });
+        const safeId = sanitizeForFilename(effectiveId);
+        const outPath = path.join(outDir, `odk_segments_${safeId}.json`);
+        const payload = {
+          instanceId: effectiveId,
+          submissionDate: doc && doc.__system && doc.__system.submissionDate,
+          agent_id: doc && doc.agent_id,
+          audioCandidates,
+          segments,
+        };
+        await fs.promises.writeFile(outPath, JSON.stringify(payload, null, 2));
+        logger.info({ outPath, audioCandidatesCount: audioCandidates.length }, 'dry-run dumped segments to file');
+      } catch (err) {
+        logger.warn({ err, instanceId: effectiveId }, 'dry-run segment dump failed');
+      }
+    }
+
+    const depth = parseIntEnv('ODK_DRY_RUN_DEPTH', 5);
+    console.log(util.inspect(doc, { depth, colors: false, maxArrayLength: 200 }));
   } else {
     await upsertSubmission(formId, effectiveId || null, doc);
 
@@ -1121,6 +1425,11 @@ async function runOnce() {
   const odk = createOdkClient({ baseUrl: process.env.ODK_BASE_URL, loginUrl: process.env.ODK_LOGIN_URL, email: process.env.ODK_EMAIL, pass: process.env.ODK_PASS, mediaTemplate: process.env.MEDIA_URL_TEMPLATE, submissionsTemplate: process.env.ODK_SUBMISSIONS_URL_TEMPLATE || process.env.ODK_SUBMISSIONS_URL });
   await odk.login();
 
+  // Reuse the CLI timeout for all ODK HTTP calls, including attachment downloads.
+  if (odk && odk.axios && odk.axios.defaults) {
+    odk.axios.defaults.timeout = opts.navTimeoutMs || 60000;
+  }
+
   // mongo connection and bucket
   const { db } = await connect();
   const gridfsBucket = getBucket();
@@ -1149,6 +1458,14 @@ async function runOnce() {
     s3client = new S3Client(s3Config);
   }
 
+  // Log media compression config (applies only for S3 uploads).
+  logger.info({
+    enabled: shouldCompressOdkImagesForS3(),
+    maxWidth: parseIntEnv('ODK_MEDIA_MAX_WIDTH', 1600),
+    jpegQuality: parseIntEnv('ODK_MEDIA_JPEG_QUALITY', 75),
+    pngCompressionLevel: parseIntEnv('ODK_MEDIA_PNG_COMPRESSION_LEVEL', 9),
+  }, 'ODK media image compression config');
+
   // determine since
   let since = null;
   if (opts.since) {
@@ -1157,6 +1474,14 @@ async function runOnce() {
   } else if (!opts.ignoreState) {
     const state = await getSyncState(formId);
     if (state && state.lastSyncAt) since = new Date(new Date(state.lastSyncAt).getTime() - backwindow);
+  }
+
+  // Optional upper bound for sync listing (exclusive).
+  // Note: backfill modes already use opts.until for Mongo filtering; this is for ODK listing.
+  let until = null;
+  if (opts.until) {
+    const d = parseSinceInput(opts.until);
+    until = d;
   }
 
   // navigationLink URLs returned by OData are often relative to the .svc root.
@@ -1180,15 +1505,19 @@ async function runOnce() {
     return u;
   }
 
-  if (opts.backfillMedia) {
-    await backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, projectId, formId });
-    return;
-  }
-
+  // Backfill modes: allow running multiple in one invocation.
+  // Recommended order: hydrate structured repeats first, then backfill media based on hydrated fields.
+  const anyBackfill = Boolean(opts.backfillSegments || opts.backfillPointVueUsagers || opts.backfillMedia);
   if (opts.backfillSegments) {
     await backfillSegmentsOnly({ odk, db, projectId, formId, resolveNavLink });
-    return;
   }
+  if (opts.backfillPointVueUsagers) {
+    await backfillPointVueUsagersOnly({ odk, db, projectId, formId, resolveNavLink });
+  }
+  if (opts.backfillMedia) {
+    await backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, projectId, formId });
+  }
+  if (anyBackfill) return;
 
   let skip = 0;
   let maxSeen = null;
@@ -1263,10 +1592,13 @@ async function runOnce() {
     qs.push(`$top=${pageSize}`);
     qs.push(`$skip=${skip}`);
     if (orderBy) qs.push(`$orderby=${encodeURIComponent(orderBy)}`);
-    if (since && opts.serverFilterSince !== false) {
+    if ((since || until) && opts.serverFilterSince !== false) {
       // ODK Central OData accepts ISO timestamps directly, and also quoted.
       // We prefer unquoted to keep query shorter.
-      const expr = `__system/submissionDate gt ${since.toISOString()}`;
+      const parts = [];
+      if (since) parts.push(`__system/submissionDate gt ${since.toISOString()}`);
+      if (until) parts.push(`__system/submissionDate lt ${until.toISOString()}`);
+      const expr = parts.join(' and ');
       qs.push(`$filter=${encodeURIComponent(expr)}`);
     }
     return qs.length ? `?${qs.join('&')}` : '';
@@ -1293,6 +1625,7 @@ async function runOnce() {
       const normalizedId = rawId ? normalizeInstanceId(rawId) : null;
       const listedAt = getRemoteUpdatedAtFromListItem(item) || null;
       if (since && listedAt && listedAt <= since) return false;
+      if (until && listedAt && listedAt >= until) return false;
 
       if (listedAt && (!maxSeen || listedAt > maxSeen)) maxSeen = listedAt;
 
