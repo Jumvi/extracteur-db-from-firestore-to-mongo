@@ -10,6 +10,7 @@
 6. [Performance](#performance)
 7. [Sécurité](#sécurité)
 8. [Extensibilité](#extensibilité)
+9. [Catalogue des scripts npm](#catalogue-des-scripts-npm)
 
 ---
 
@@ -629,6 +630,44 @@ async getCollections() {
 ### Q: Comment gérer les FieldValue.serverTimestamp() ?
 
 R: Ces valeurs sont résolues côté Firestore. Lors de l'extraction, vous recevez déjà la Timestamp résolue.
+
+---
+
+## Catalogue des scripts npm
+
+Objectif : disposer d’un catalogue exploitable des commandes, avec une règle simple.
+
+Règle d’exploitation : **on ne modifie pas** une commande déjà publiée dans `package.json`.
+Si un besoin évolue (nouvelle fenêtre, nouvelle concurrence, etc.), **on ajoute un nouveau script** avec un nouveau nom.
+
+| Script (`npm run …`) | Commande | Ce que ça fait |
+|---|---|---|
+| `start` | `node src/index.js` | Lance l’ETL Firestore → Mongo (orchestrateur). |
+| `migrate` | `node src/index.js` | Alias de `start`. |
+| `mongo:copy:selected` | `node scripts/mongoCopySelectedCollections.js` | Copie des collections Mongo (outil utilitaire). |
+| `odk:listForms` | `node scripts/listForms.js` | Liste les formulaires ODK d’un projet. |
+| `odk:migrate` | `node src/odk-migrate.js --once --exclude-tests` | Sync ODK → Mongo (1 passe), en excluant les tests. |
+| `odk:migrate:daemon` | `node src/odk-migrate.js --daemon --exclude-tests --expand "…"` | Sync ODK → Mongo en continu (daemon) + `$expand` sur groupes connus. |
+| `odk:migrate:daemon:expand` | `node src/odk-migrate.js --daemon --all --exclude-tests --expand "…"` | Daemon sur **toutes** les formes + `$expand`. |
+| `odk:migrate:batch50` | `node src/odk-migrate.js --once --exclude-tests --pageSize 50 --limit 50` | Importe un batch de 50 (debug / échantillon). |
+| `odk:migrate:batch50:reset` | `node src/odk-migrate.js --once --exclude-tests --pageSize 50 --limit 50 --reset-state` | Batch 50 en réinitialisant l’état de sync. |
+| `odk:migrate:batch50:hydrated` | `node src/odk-migrate.js --once --exclude-tests --pageSize 50 --limit 50 --nav-depth 6` | Batch 50 + hydratation `@odata.navigationLink` (nav). |
+| `odk:migrate:batch50:hydrated:reset` | `node src/odk-migrate.js --once --exclude-tests --pageSize 50 --limit 50 --reset-state --nav-depth 6` | Batch 50 + nav + reset état. |
+| `odk:migrate:batch50:hydrated:skip-media` | `node src/odk-migrate.js --once --exclude-tests --pageSize 50 --limit 50 --nav-depth 6 --skip-media` | Batch 50 + nav, mais sans télécharger/uploader les binaires. |
+| `odk:migrate:batch50:expand` | `node src/odk-migrate.js --once --all --exclude-tests --pageSize 50 --limit 50 --nav-depth 6 --expand "…"` | Batch 50 sur toutes les formes + `$expand`. |
+| `odk:test:first50` | `node scripts/fetchFirst50.js` | Test/debug : récupère 50 submissions (script utilitaire). |
+| `odk:backfill:plan-windows:auto-range:print-only` | `node tmp/run_backfill_windows.js --auto-range --window-days 3 --print-only` | Imprime un plan de fenêtres de backfill (sans exécuter). |
+| `odk:backfill-media:window:2026-02-06_02-08:c2m2` | `node src/odk-migrate.js --form audit_chantier_routier_ouvrage_v1 …` | Backfill médias sur la fenêtre 2026-02-06 → 2026-02-08 (concurrence doc=2, media=2). |
+| `odk:backfill-media:window:2026-02-07_02-11:c2m2` | `node src/odk-migrate.js --form audit_chantier_routier_ouvrage_v1 …` | Backfill médias sur 2026-02-07 → 2026-02-11 (doc=2, media=2). |
+| `odk:backfill-media:window:2026-02-07_02-11:c1m1` | `node src/odk-migrate.js --form audit_chantier_routier_ouvrage_v1 …` | Même fenêtre mais plus lent/robuste (doc=1, media=1). |
+| `odk:backfill-media:window:2026-02-10_02-14:c2m2` | `node src/odk-migrate.js --form audit_chantier_routier_ouvrage_v1 …` | Backfill médias sur 2026-02-10 → 2026-02-14 (doc=2, media=2). |
+| `mongo:media-window-status:2026-02-06_02-08` | `node tmp/mongo_media_window_status.js audit_chantier_routier_ouvrage_v1 2026-02-06 2026-02-08` | Statut médias côté Mongo (fenêtre). |
+| `mongo:media-window-status:2026-02-07_02-11` | `node tmp/mongo_media_window_status.js audit_chantier_routier_ouvrage_v1 2026-02-07 2026-02-11` | Statut médias côté Mongo (fenêtre). |
+| `mongo:media-window-status:2026-02-10_02-14` | `node tmp/mongo_media_window_status.js audit_chantier_routier_ouvrage_v1 2026-02-10 2026-02-14` | Statut médias côté Mongo (fenêtre). |
+| `geosuivi:spaces:copy-media:flagged:dry-run` | `node tmp/geosuivi_spaces_copy_media.js --dry-run --limit-rapports 30` | GeoSuivi → Spaces uniquement : lit les rapports `flag_rapport=1`, extrait les filenames, liste 1x l’ancien préfixe par UUID, puis simule la copie vers le nouveau préfixe. Sort un rapport JSON + liste `missing[]` et append les manquants dans `tmp/geosuivi_spaces_copy_missing.ndjson`. |
+| `geosuivi:spaces:copy-media:flagged` | `node tmp/geosuivi_spaces_copy_media.js --limit-rapports 30` | Idem, mais effectue les copies (`CopyObject`) de l’ancien préfixe vers le nouveau. Append aussi les manquants dans `tmp/geosuivi_spaces_copy_missing.ndjson`. |
+| `geosuivi:spaces:repair-missing:dry-run` | `node tmp/geosuivi_spaces_repair_missing_media.js --dry-run` | Répare les médias manquants en téléchargeant `GEOSUIVI_MEDIA_BASE_URL/<filename>`, compresse < 1MiB, puis upload dans **l’ancien** et **le nouveau** préfixe Spaces. Entrée: `tmp/geosuivi_spaces_copy_missing.ndjson`. |
+| `geosuivi:spaces:repair-missing` | `node tmp/geosuivi_spaces_repair_missing_media.js` | Idem, mais effectue les uploads (`PutObject`) dans les 2 préfixes. |
 
 ---
 

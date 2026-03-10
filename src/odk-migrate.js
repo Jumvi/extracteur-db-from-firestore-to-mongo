@@ -27,6 +27,18 @@ function getErrCode(err) {
   return err.code || err.errno || err.name || null;
 }
 
+function getHttpStatus(err) {
+  if (!err) return null;
+  // Axios-style
+  const axiosStatus = err && err.response && err.response.status;
+  // AWS SDK v3
+  const awsStatus = err && err.$metadata && err.$metadata.httpStatusCode;
+  // Misc fallbacks
+  const other = err.statusCode || err.status || null;
+  const n = Number(axiosStatus || awsStatus || other);
+  return Number.isFinite(n) ? n : null;
+}
+
 function isRetryableHttpStatus(status) {
   const n = Number(status);
   if (!Number.isFinite(n)) return false;
@@ -42,6 +54,8 @@ function isRetryableNetworkErr(err) {
   const code = String(getErrCode(err) || '').toUpperCase();
   const msg = String(err && err.message ? err.message : '').toUpperCase();
   if (code.includes('TIMEOUT') || msg.includes('TIMEOUT')) return true;
+  if (code === 'ABORTERROR') return true;
+  if (msg.includes('REQUEST ABORT')) return true;
   if (code === 'ETIMEDOUT') return true;
   if (code === 'ECONNRESET') return true;
   if (code === 'EPIPE') return true;
@@ -63,7 +77,7 @@ async function withRetries(label, fn, {
       return await fn(attempt);
     } catch (err) {
       lastErr = err;
-      const status = err && err.response && err.response.status;
+      const status = getHttpStatus(err);
       const retryable = isRetryableNetworkErr(err) || isRetryableHttpStatus(status);
       if (!retryable || attempt > retries) throw err;
       const delay = Math.min(maxDelayMs, baseDelayMs * (2 ** (attempt - 1)));
@@ -109,6 +123,10 @@ async function sendS3WithTimeout(s3client, cmd) {
 function shouldCompressOdkImagesForS3() {
   // Off by default to preserve current behavior unless explicitly enabled.
   return parseBoolEnv('ODK_MEDIA_COMPRESS_IMAGES', false);
+}
+
+function getMinCompressBytes() {
+  return parseIntEnv('MIN_BYTES', 1024 * 1024);
 }
 
 function isJpegFilename(name) {
@@ -348,6 +366,24 @@ async function uploadToS3(s3client, bucket, key, streamBody, contentType) {
   }
 }
 
+async function uploadFilePathToS3(s3client, bucket, key, filePath, size, contentType) {
+  const acl = process.env.S3_PUBLIC_ACL || 'public-read';
+  const effectiveSize = Number.isFinite(size) && size >= 0 ? size : undefined;
+  const url = await withRetries('s3.putObject', async () => {
+    const readStream = fs.createReadStream(filePath);
+    const params = { Bucket: bucket, Key: key, Body: readStream, ContentType: contentType, ACL: acl };
+    if (typeof effectiveSize !== 'undefined') params.ContentLength = effectiveSize;
+    const cmd = new PutObjectCommand(params);
+    await sendS3WithTimeout(s3client, cmd);
+    return buildPublicUrl(bucket, key);
+  }, {
+    retries: parseIntEnv('S3_PUT_RETRIES', 3),
+    baseDelayMs: parseIntEnv('S3_PUT_RETRY_BASE_MS', 750),
+    maxDelayMs: parseIntEnv('S3_PUT_RETRY_MAX_MS', 8000),
+  });
+  return url;
+}
+
 function buildPublicUrl(bucket, key) {
   const useCdn = (process.env.S3_USE_CDN || '').toString().toLowerCase() === 'true';
   const cdn = process.env.S3_CDN;
@@ -426,10 +462,24 @@ function shouldPutAudioInSubfolder() {
   return v === '1' || v === 'true' || v === 'yes' || v === 'y';
 }
 
+function normalizeInstanceFolder(instanceId) {
+  const s = String(instanceId || '').trim();
+  if (!s) return 'unknown_instance';
+  if (s.toLowerCase().startsWith('uuid:')) return s.slice(5);
+  return s;
+}
+
+function getS3KeyPrefix(formId) {
+  const p = (process.env.S3_KEY_PREFIX || '').toString().trim();
+  return p || formId;
+}
+
 function buildS3Key({ formId, instanceId, filename }) {
   // Keep existing structure for images/docs/videos for backward compatibility.
   // Optionally place audio under an "audio/" subfolder to make prefix listing lighter.
-  const base = `${formId}/${instanceId}/`;
+  const prefix = getS3KeyPrefix(formId);
+  const instanceFolder = prefix === formId ? String(instanceId) : normalizeInstanceFolder(instanceId);
+  const base = `${prefix}/${instanceFolder}/`;
   if (shouldPutAudioInSubfolder() && isAudioFilenameOnly(filename)) {
     return `${base}audio/${filename}`;
   }
@@ -897,59 +947,53 @@ async function backfillMediaOnly({ odk, db, gridfsBucket, s3client, s3bucket, pr
                   try {
                     const inputStream = mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes;
                     originalTmp = await streamToTempFile(inputStream, 'odk_img_original');
-                    compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
-                    const url = await uploadToS3(
+
+                    const minBytes = getMinCompressBytes();
+
+                    let uploadPath = originalTmp.tmpPath;
+                    let uploadSize = originalTmp.size;
+                    let uploadContentType = inputContentType;
+
+                    let store = {
+                      s3Compressed: false,
+                      s3ContentType: inputContentType,
+                      s3Bytes: originalTmp.size,
+                    };
+
+                    if (Number.isFinite(minBytes) && originalTmp.size >= minBytes) {
+                      try {
+                        compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
+                        if (compressedTmp && compressedTmp.size && compressedTmp.size < originalTmp.size) {
+                          uploadPath = compressedTmp.tmpPath;
+                          uploadSize = compressedTmp.size;
+                          uploadContentType = compressedTmp.contentType;
+                          store = {
+                            s3Compressed: true,
+                            s3ContentType: compressedTmp.contentType,
+                            s3Bytes: compressedTmp.size,
+                          };
+                        }
+                      } catch (err) {
+                        logger.warn({ err, formId, instanceId, filename }, 'image compression failed during backfill-media; uploading original');
+                      }
+                    }
+
+                    const url = await uploadFilePathToS3(
                       s3client,
                       s3bucket,
                       key,
-                      {
-                        stream: fs.createReadStream(compressedTmp.tmpPath),
-                        headers: {
-                          'content-length': String(compressedTmp.size),
-                          'content-type': compressedTmp.contentType,
-                        },
-                      },
-                      compressedTmp.contentType
+                      uploadPath,
+                      uploadSize,
+                      uploadContentType
                     );
+
                     return {
                       store: {
+                        ...store,
                         s3: url,
-                        s3Compressed: true,
-                        s3ContentType: compressedTmp.contentType,
-                        s3Bytes: compressedTmp.size,
                       },
                       url,
                     };
-                  } catch (err) {
-                    logger.warn({ err, formId, instanceId, filename }, 'image compression failed during backfill-media; uploading original');
-                    // Best-effort fallback: upload original (we already buffered it on disk).
-                    let url;
-                    if (originalTmp && originalTmp.tmpPath) {
-                      const st = await fs.promises.stat(originalTmp.tmpPath);
-                      url = await uploadToS3(
-                        s3client,
-                        s3bucket,
-                        key,
-                        {
-                          stream: fs.createReadStream(originalTmp.tmpPath),
-                          headers: {
-                            'content-length': String(st.size),
-                            'content-type': inputContentType,
-                          },
-                        },
-                        inputContentType
-                      );
-                    } else {
-                      const mediaRes2 = await odk.downloadMedia(projectId, formId, instanceId, filename);
-                      url = await uploadToS3(
-                        s3client,
-                        s3bucket,
-                        key,
-                        mediaRes2,
-                        (mediaRes2 && mediaRes2.headers && (mediaRes2.headers['content-type'] || mediaRes2.headers['Content-Type'])) || inputContentType
-                      );
-                    }
-                    return { store: { s3: url }, url };
                   } finally {
                     try { if (originalTmp && originalTmp.tmpPath) await fs.promises.unlink(originalTmp.tmpPath); } catch (_) { /* ignore */ }
                     try { if (compressedTmp && compressedTmp.tmpPath) await fs.promises.unlink(compressedTmp.tmpPath); } catch (_) { /* ignore */ }
@@ -1273,43 +1317,53 @@ async function processSubmission(odk, s3client, s3bucket, bucket, projectId, for
 
           // Optional: compress images before upload to make frontend usage faster.
           // Enabled via env ODK_MEDIA_COMPRESS_IMAGES=true.
+          // Only compress when original size >= MIN_BYTES (default 1MiB), and only if compressed output is smaller.
           if (shouldCompressOdkImagesForS3() && isCompressibleImage(filename, inputContentType)) {
             let originalTmp = null;
             let compressedTmp = null;
             try {
               const inputStream = mediaRes && mediaRes.stream ? mediaRes.stream : mediaRes;
               originalTmp = await streamToTempFile(inputStream, 'odk_img_original');
-              compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
+
+              const minBytes = getMinCompressBytes();
+
+              let uploadPath = originalTmp.tmpPath;
+              let uploadSize = originalTmp.size;
+              let uploadContentType = inputContentType;
+              let compressed = false;
+
+              if (Number.isFinite(minBytes) && originalTmp.size >= minBytes) {
+                try {
+                  compressedTmp = await compressImageFileToTemp({ inputPath: originalTmp.tmpPath, filename, contentType: inputContentType });
+                  if (compressedTmp && compressedTmp.size && compressedTmp.size < originalTmp.size) {
+                    uploadPath = compressedTmp.tmpPath;
+                    uploadSize = compressedTmp.size;
+                    uploadContentType = compressedTmp.contentType;
+                    compressed = true;
+                  }
+                } catch (err) {
+                  logger.warn({ err, formId, instanceId: effectiveId, filename }, 'image compression failed; uploading original');
+                }
+              }
+
               const url = await uploadToS3(
                 s3client,
                 s3bucket,
                 key,
                 {
-                  stream: fs.createReadStream(compressedTmp.tmpPath),
+                  stream: fs.createReadStream(uploadPath),
                   headers: {
-                    'content-length': String(compressedTmp.size),
-                    'content-type': compressedTmp.contentType,
+                    'content-length': String(uploadSize),
+                    'content-type': uploadContentType,
                   },
                 },
-                compressedTmp.contentType
+                uploadContentType
               );
+
               att.s3 = url;
-              att.s3Compressed = true;
-              att.s3ContentType = compressedTmp.contentType;
-              att.s3Bytes = compressedTmp.size;
-              doc[`${fieldPath}_url`] = url;
-            } catch (err) {
-              logger.warn({ err, formId, instanceId: effectiveId, filename }, 'image compression failed; uploading original');
-              // Best-effort fallback: re-download and upload original.
-              const mediaRes2 = await odk.downloadMedia(projectId, formId, effectiveId, filename);
-              const url = await uploadToS3(
-                s3client,
-                s3bucket,
-                key,
-                mediaRes2,
-                (mediaRes2 && mediaRes2.headers && (mediaRes2.headers['content-type'] || mediaRes2.headers['Content-Type'])) || inputContentType
-              );
-              att.s3 = url;
+              att.s3Compressed = compressed;
+              att.s3ContentType = uploadContentType;
+              att.s3Bytes = uploadSize;
               doc[`${fieldPath}_url`] = url;
             } finally {
               try { if (originalTmp && originalTmp.tmpPath) await fs.promises.unlink(originalTmp.tmpPath); } catch (_) { /* ignore */ }
