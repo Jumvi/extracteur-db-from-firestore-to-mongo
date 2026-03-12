@@ -12,18 +12,16 @@ export class AuditController {
   @Post('strict')
   @ApiOperation({ summary: 'Audit des rapports flag_rapport=1 — identifie médias manquants' })
   @ApiBody({
-    description: 'Paramètres d’audit. Fournir soit `uuids` pour auditer des rapports spécifiques, soit `since`/`until` pour une fenêtre temporelle, ou rien pour un audit global.',
+    description: 'Paramètres d’audit. Fournir soit `uuids` pour auditer des rapports spécifiques, soit `since`/`until` (ISO date) pour une fenêtre temporelle, ou rien pour un audit global. Les dates se basent sur `date_fincollecte` quand disponible.',
     type: StrictAuditDto,
     required: true,
     examples: {
-      example_by_uuids: {
-        summary: 'Audit pour une liste d’UUIDs',
-        value: { uuids: ['5fcfea2a-470b-4587-9d46-efb5fac8272b'], dryRun: true }
+      default: {
+        summary: 'Exemple complet',
+        value: { id: 'job-123', limitUuids: 10, dryRun: true, since: '2026-02-01', until: '2026-02-28' }
       },
-      example_by_window: {
-        summary: 'Audit pour une fenêtre temporelle',
-        value: { since: '2026-02-07', until: '2026-02-11', dryRun: true }
-      }
+      byUuids: { summary: 'Audit pour une liste d’UUIDs', value: { uuids: ['5fcfea2a-470b-4587-9d46-efb5fac8272b'], dryRun: true } },
+      byWindow: { summary: 'Audit pour une fenêtre temporelle', value: { since: '2026-02-07', until: '2026-02-11', dryRun: true } }
     }
   })
   async strict(@Body() body: StrictAuditDto) {
@@ -37,9 +35,10 @@ export class AuditController {
     type: RepairDto,
     required: true,
     examples: {
-      example_single: { summary: 'Réparer un UUID', value: { uuid: '5fcfea2a-470b-4587-9d46-efb5fac8272b' } },
-      example_list: { summary: 'Réparer plusieurs UUIDs', value: { uuids: ['uuid1','uuid2'], concurrency: 2 } },
-      example_input: { summary: 'Réparer à partir d’un fichier NDJSON', value: { input: 'tmp/audit_flag1_missing.ndjson', overwrite: true } }
+      default: { summary: 'Exemple complet', value: { uuids: ['5fcfea2a-470b-4587-9d46-efb5fac8272b'], concurrency: 2, overwrite: false } },
+      single: { summary: 'Réparer un UUID', value: { uuid: '5fcfea2a-470b-4587-9d46-efb5fac8272b' } },
+      list: { summary: 'Réparer plusieurs UUIDs', value: { uuids: ['uuid1','uuid2'], concurrency: 2 } },
+      input: { summary: 'Réparer à partir d’un fichier NDJSON', value: { input: 'tmp/audit_flag1_missing.ndjson', overwrite: true } }
     }
   })
   async repair(@Body() body: RepairDto) {

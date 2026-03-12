@@ -5,7 +5,7 @@ Commande:
   node tmp/compare_counts_geosuivi_s3.js
 
 Variables d'environnement utiles:
-- `RAPPORT_LIST_URL` et `RAPPORT_DETAILS_BASE` pour pointer vers l'API GeoSuivi
+- `GEOSUIVI_GETRAPPORTLIST_URL` et `GEOSUIVI_API_URL` pour pointer vers l'API GeoSuivi
 - `S3_BUCKET`, `S3_ENDPOINT`, `AWS_REGION`, `S3_FORCE_PATH_STYLE`
 
 Sorties:

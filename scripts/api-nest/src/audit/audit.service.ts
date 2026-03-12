@@ -23,8 +23,8 @@ export class AuditService {
     }
 
     // 2) date window supplied -> fetch GeoSuivi list and filter by date
-    const hasSince = opts.since && String(opts.since).trim() !== '';
-    const hasUntil = opts.until && String(opts.until).trim() !== '';
+    const hasSince = opts.since && !isNaN(Date.parse(String(opts.since)));
+    const hasUntil = opts.until && !isNaN(Date.parse(String(opts.until)));
     if (hasSince || hasUntil) {
       const listUrl = process.env.GEOSUIVI_GETRAPPORTLIST_URL || process.env.GEOSUIVI_API_URL;
       if (!listUrl) throw new BadRequestException('GeoSuivi list URL not configured in environment. Set GEOSUIVI_GETRAPPORTLIST_URL');
@@ -47,18 +47,25 @@ export class AuditService {
         const flag = r.flag_rapport;
         if (!(flag === 1 || flag === '1' || flag === true)) continue;
 
-        // find a date-like property
+        // Prefer explicit `date_fincollecte` (GeoSuivi period end), then fall back to any date-like field
         let dt: Date | null = null;
-        for (const k of Object.keys(r)) {
-          const v = r[k];
-          if (!v) continue;
-          if (typeof v === 'string' && /\d{4}-\d{2}-\d{2}/.test(v)) {
-            const d = new Date(v);
-            if (!isNaN(d.getTime())) { dt = d; break; }
-          }
-          if (typeof v === 'number') {
-            const d = new Date(v);
-            if (!isNaN(d.getTime())) { dt = d; break; }
+        const fin = r.date_fincollecte || r.dateFinCollecte || r.date_fin || r.date_fin_collecte;
+        if (fin) {
+          const d = new Date(fin);
+          if (!isNaN(d.getTime())) dt = d;
+        }
+        if (!dt) {
+          for (const k of Object.keys(r)) {
+            const v = r[k];
+            if (!v) continue;
+            if (typeof v === 'string' && /\d{4}-\d{2}-\d{2}/.test(v)) {
+              const d = new Date(v);
+              if (!isNaN(d.getTime())) { dt = d; break; }
+            }
+            if (typeof v === 'number') {
+              const d = new Date(v);
+              if (!isNaN(d.getTime())) { dt = d; break; }
+            }
           }
         }
         if (since && dt && dt < since) continue;

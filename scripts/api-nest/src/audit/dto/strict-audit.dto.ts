@@ -1,5 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsOptional, IsString, IsInt, Min, IsBoolean } from 'class-validator';
+import { IsOptional, IsString, IsInt, Min, IsBoolean, IsArray } from 'class-validator';
 
 export class StrictAuditDto {
   @ApiProperty({ required: false, type: 'string', description: 'Job id (string)' })
@@ -12,39 +12,36 @@ export class StrictAuditDto {
   @IsInt()
   pid?: number;
 
-  @ApiProperty({
-    required: false,
-    type: 'integer',
-    description: "Limite du nombre d'UUIDs à vérifier (utile pour tests)"
-  })
+  @ApiProperty({ required: false, type: 'integer', description: "Limite du nombre d'UUIDs à vérifier (utile pour tests)", example: 10 })
   @IsOptional()
   @IsInt()
   @Min(1)
   limitUuids?: number;
 
-  @ApiProperty({
-    required: false,
-    type: 'string',
-    description: 'Filtrer rapports depuis cette date (ISO yyyy-mm-dd or full ISO)',
-    example: '2026-02-07'
-  })
+  @ApiProperty({ required: false, type: 'boolean', description: 'Si true, exécute l’audit en mode `dry-run`', example: true })
   @IsOptional()
   @IsBoolean()
   dryRun?: boolean;
 
-  @ApiProperty({ required: false, type: 'string', description: 'Filtrer rapports jusqu’à cette date (ISO)', example: '2026-02-11' })
+  @ApiProperty({ required: false, type: 'string', description: "Filtrer rapports depuis cette date (ISO yyyy-mm-dd or full ISO). Note: GeoSuivi définit les périodes via le champ `date_fincollecte` — les filtres s'appliquent sur ce champ quand présent.", example: '2026-02-07' })
   @IsOptional()
   @IsString()
   since?: string;
 
-  @ApiProperty({ required: false, type: 'array', description: 'Liste explicite d’UUIDs à auditer', example: ['5fcfea2a-470b-4587-9d46-efb5fac8272b'] })
+  @ApiProperty({ required: false, type: 'string', description: "Filtrer rapports jusqu’à cette date (ISO). Note: GeoSuivi définit les périodes via `date_fincollecte` — les filtres s'appliquent sur ce champ quand présent.", example: '2026-02-11' })
   @IsOptional()
   @IsString()
   until?: string;
-  @ApiProperty({ required: false, type: 'boolean', description: 'Si true, auditer tous les rapports (ignore pagination/limits)', example: false })
-  @ApiProperty({ required: false, type: 'array', description: 'Liste explicite d’UUIDs à auditer' })
+
+  @ApiProperty({ required: false, type: 'array', description: 'Liste explicite d’UUIDs à auditer', example: ['5fcfea2a-470b-4587-9d46-efb5fac8272b'] })
   @IsOptional()
+  @IsArray()
   uuids?: string[];
+
+  @ApiProperty({ required: false, type: 'boolean', description: 'Si true, auditer tous les rapports (ignore pagination/limits)', example: false })
+  @IsOptional()
+  @IsBoolean()
+  all?: boolean;
 
   // Small example quick references for Swagger users
   static exampleByUuids() {
@@ -54,9 +51,4 @@ export class StrictAuditDto {
   static exampleByWindow() {
     return { since: '2026-02-07', until: '2026-02-11', dryRun: true };
   }
-
-  @ApiProperty({ required: false, type: 'boolean', description: 'Si true, auditer tous les rapports (ignore pagination/limits)' })
-  @IsOptional()
-  @IsBoolean()
-  all?: boolean;
 }
