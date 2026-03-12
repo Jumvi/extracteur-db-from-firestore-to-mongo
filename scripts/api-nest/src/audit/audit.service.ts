@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException, BadGatewayException } from '@nestjs/common';
 import { spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -23,14 +23,22 @@ export class AuditService {
     }
 
     // 2) date window supplied -> fetch GeoSuivi list and filter by date
-    if (opts.since || opts.until) {
+    const hasSince = opts.since && String(opts.since).trim() !== '';
+    const hasUntil = opts.until && String(opts.until).trim() !== '';
+    if (hasSince || hasUntil) {
       const listUrl = process.env.GEOSUIVI_GETRAPPORTLIST_URL || process.env.GEOSUIVI_API_URL;
-      if (!listUrl) throw new Error('GeoSuivi list URL not configured in environment');
+      if (!listUrl) throw new BadRequestException('GeoSuivi list URL not configured in environment. Set GEOSUIVI_GETRAPPORTLIST_URL');
 
-      const since = opts.since ? new Date(opts.since) : null;
-      const until = opts.until ? new Date(opts.until) : null;
+      const since = hasSince ? new Date(opts.since) : null;
+      const until = hasUntil ? new Date(opts.until) : null;
       this.logger.log(`Fetching GeoSuivi list from ${listUrl} to filter by date window`);
-      const resp = await axios.get(listUrl);
+      let resp;
+      try {
+        resp = await axios.get(listUrl, { timeout: 90000 });
+      } catch (err) {
+        this.logger.error('Failed to fetch GeoSuivi list', err as any);
+        throw new BadGatewayException('Failed to fetch GeoSuivi list: ' + String((err as any)?.message || err));
+      }
       const items = Array.isArray(resp.data) ? resp.data : resp.data?.results || [];
       const picked: string[] = [];
       for (const r of items) {
@@ -98,8 +106,7 @@ export class AuditService {
       if (opts.dryRun) args.push('--dry-run');
       return this.spawnScript('repair-uuids.sh', args);
     }
-
-    throw new Error('runRepair requires either opts.input or opts.uuids[]');
+    throw new BadRequestException('runRepair requires either `input` (NDJSON path) or `uuids` array');
   }
 
   status(id: string) {
@@ -114,7 +121,13 @@ export class AuditService {
     const script = path.join(process.cwd(), 'scripts', 'commands', name);
     const id = String(Date.now());
     const outLog = path.join(process.cwd(), 'tmp', `job_${id}.log`);
-    const child = spawn(script, args, { env: process.env, shell: true });
+    let child;
+    try {
+      child = spawn(script, args, { env: process.env, shell: true });
+    } catch (err) {
+      try { fs.writeFileSync(outLog, `spawn-error: ${String(err)}`); } catch (e) {}
+      return { id, pid: 0, error: String(err) };
+    }
     const chunks: string[] = [];
     if (child.stdout) child.stdout.on('data', (d) => chunks.push(String(d)));
     if (child.stderr) child.stderr.on('data', (d) => chunks.push(String(d)));
