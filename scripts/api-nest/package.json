@@ -1,0 +1,23 @@
+{
+  "name": "export-firestore-mongo-api-nest",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start:dev": "ts-node --transpile-only -r reflect-metadata src/main.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@nestjs/common": "^9.0.0",
+    "@nestjs/core": "^9.0.0",
+    "@nestjs/platform-express": "^9.0.0",
+    "reflect-metadata": "^0.1.13",
+    "@nestjs/swagger": "^6.0.0",
+    "swagger-ui-express": "^4.6.3",
+    "class-transformer": "^0.5.1",
+    "class-validator": "^0.14.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.0.0",
+    "typescript": "^4.0.0"
+  }
+}
