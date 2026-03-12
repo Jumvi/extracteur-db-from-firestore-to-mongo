@@ -38,4 +38,21 @@ export class RepairDto {
   @IsOptional()
   @IsBoolean()
   overwrite?: boolean;
+
+  @ApiProperty({
+    required: false,
+    type: 'array',
+    description: 'Liste des UUIDs à réparer (si fournie, l’API générera le NDJSON puis réparera)'
+  })
+  @IsOptional()
+  uuids?: string[];
+
+  // Examples for Swagger UI clarity
+  static exampleSingle() {
+    return { uuid: '5fcfea2a-470b-4587-9d46-efb5fac8272b' };
+  }
+
+  static exampleList() {
+    return { uuids: ['5fcfea2a-470b-4587-9d46-efb5fac8272b', '38e920d7-ee35-447c-a037-425f1068726d'], concurrency: 2 };
+  }
 }
