@@ -2,11 +2,6 @@ import { ApiProperty } from '@nestjs/swagger';
 import { IsOptional, IsString, IsInt, Min, IsBoolean, IsArray } from 'class-validator';
 
 export class StrictAuditDto {
-  @ApiProperty({ required: false, type: 'string', description: 'Job id (string)' })
-  @IsOptional()
-  @IsString()
-  id?: string;
-
   @ApiProperty({ required: false, type: 'integer', description: 'PID number from a previous run' })
   @IsOptional()
   @IsInt()
